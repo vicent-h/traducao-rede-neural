@@ -5,6 +5,7 @@ import logging
 import os
 from models.lstm import LSTM
 from utils.dataset import TranslateDataset
+from utils.earlystopper import EarlyStopper
 import pandas as pd
 from logging import getLogger
 import torch
@@ -20,8 +21,8 @@ def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLos
     model.eval()
     with torch.no_grad():
         for src, tgt in tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
-            src = torch.tensor(src).to(train_config["device"])
-            tgt = torch.tensor(tgt).to(train_config["device"])
+            src = src.to(train_config["device"])
+            tgt = tgt.to(train_config["device"])
 
             loss = model.eval_step(src, tgt, criterion)
 
@@ -46,25 +47,23 @@ def save_configs(args):
         
 
 def train(
-    model: nn.Module, 
+    model: LSTM, 
     dataloader: DataLoader,
     dataloader_eval: DataLoader,
     criterion: nn.CrossEntropyLoss,
     optimizer: torch.optim.Optimizer,
     train_config: dict,
     step_info: dict,
-    writer: SummaryWriter
-
+    writer: SummaryWriter,
+    early_stopper: EarlyStopper
 ):
+    stop = False
     for _ in range(int(1e6)):
         for src, tgt in tqdm(dataloader, desc="Training", total=len(dataloader)):
             src: torch.Tensor
             tgt: torch.Tensor
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
-
-            tgt = tgt[:, 1:]
-            src = src[:, :-1]
 
             loss = model.train_step(src, tgt, criterion, optimizer)
 
@@ -79,15 +78,26 @@ def train(
 
             if step_info["step"] % train_config["save_steps"] == 0:
                 os.makedirs("artifacts", exist_ok=True)
-                torch.save(model.state_dict(), f'artifacts/model.pt')
                 logger.info(f'Model saved at step {step_info["step"]}')
 
             if step_info["step"] % train_config["eval_steps"] == 0:
                 eval(model, dataloader_eval, criterion, step_info, writer)
-                logger.info(f'Step {step_info["step"]} - Eval Loss: {step_info["loss_eval"] / len(dataloader_eval):.4f}')
-                writer.add_scalar("Loss/Eval", step_info["loss_eval"] / len(dataloader_eval), step_info["step"])
+                eval_loss = step_info["loss_eval"] / len(dataloader_eval)
+                logger.info(f'Step {step_info["step"]} - Eval Loss: {eval_loss:.4f}')
+                writer.add_scalar("Loss/Eval", eval_loss, step_info["step"])
                 step_info["loss_eval"] = 0
 
+                if eval_loss < step_info["best_eval_loss"]:
+                    step_info["best_eval_loss"] = eval_loss
+                    torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
+                    logger.info(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
+
+                stop = early_stopper.step(eval_loss)
+                if stop:
+                    logger.info("Early stopping triggered.")
+                    break
+        if stop:
+            break
 
 
 if __name__ == "__main__":
@@ -109,6 +119,8 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    args.add_argument("--early_stop_patience", type=int, default=5000)
+    args.add_argument("--early_stop_min_delta", type=float, default=0.0)
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
@@ -162,15 +174,17 @@ if __name__ == "__main__":
     step_info = {
         "loss_train": 0,
         "loss_eval": 0,
-        "step": 0
+        "step": 0,
+        'best_eval_loss': float('inf')
     }
 
     writer = SummaryWriter(log_dir=f"runs/{args.name}")
+    early_stopper = EarlyStopper(patience=args.early_stop_patience, min_delta=args.early_stop_min_delta)
 
     save_configs(args)
 
     logger.info("Starting training loop...")
-    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer)
+    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper)
 
 
 

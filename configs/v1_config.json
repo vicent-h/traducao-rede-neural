@@ -15,5 +15,7 @@
     "eval_steps": 1000,
     "device": "cuda",
     "desc": "Treinamento inicial",
-    "name": "v1"
+    "name": "v1",
+    "early_stop_patience": 5000,
+    "early_stop_min_delta": 0.0
 }

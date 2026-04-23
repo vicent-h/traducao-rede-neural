@@ -83,10 +83,10 @@ class LSTM(nn.Module):
     def train_step(self, src, tgt, criterion, optimizer):
         self.train()
         optimizer.zero_grad()
-        output = self(src, tgt) # [tgt_len, batch_size, vocab_size]
+        output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
         output_dim = output.shape[-1] # (vocab_size)
         output = output.view(-1, output_dim) # [tgt_len * batch_size, vocab_size]
-        tgt = tgt.reshape(-1) # [tgt_len * batch_size]
+        tgt = tgt[:, 1:].reshape(-1) # [tgt_len * batch_size]
         loss = criterion(output, tgt)
         loss.backward()
         optimizer.step()
@@ -95,9 +95,9 @@ class LSTM(nn.Module):
     def eval_step(self, src, tgt, criterion):
         self.eval()
         with torch.no_grad():
-            output = self(src, tgt) # [tgt_len, batch_size, vocab_size]
+            output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
             output_dim = output.shape[-1] # (vocab_size)
             output = output.view(-1, output_dim) # [tgt_len * batch_size, vocab_size]
-            tgt = tgt.reshape(-1) # [tgt_len * batch_size]
+            tgt = tgt[:, 1:].reshape(-1) # [tgt_len * batch_size]
             loss = criterion(output, tgt)
         return loss.item()

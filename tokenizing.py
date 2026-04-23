@@ -21,5 +21,6 @@ for name, dataset in datasets.items():
     dataset['en_tokens'] = dataset.en.progress_apply(lambda x: tokenizer.encode(x).ids)
     tqdm.pandas(desc=f'Tokenizing PT')
     dataset['pt_tokens'] = dataset.pt.progress_apply(lambda x: tokenizer.encode(x).ids)
-
-    dataset.to_csv(f'data/tokenized_{name}.csv', index=False)
+    
+    print('Exemplo: ', dataset['en_tokens'].iloc[0], '->', dataset['pt_tokens'].iloc[0])
+    dataset.to_parquet(f'data/tokenized_{name}.parquet', index=False)

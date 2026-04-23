@@ -1,5 +1,5 @@
 import pandas as pd
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
 
 
 print('Loading data...')
@@ -15,13 +15,23 @@ for vocab_size in [500, 1000, 5000, 10000, 25000, 30000, 50000]:
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         min_frequency=2,
-        special_tokens=["<PAD>", "<UNK>", "<CLS>", "<SEP>", "<MASK>"],
+        special_tokens=["<PAD>", "<UNK>", "<CLS>", "<SEP>", "<MASK>", "<BOS>", "<EOS>"],
     )
 
     print('Training tokenizer...')
     tokenizer.train_from_iterator(
         df_train['pt'].tolist() + df_train['en'].tolist(),
         trainer=trainer
+    )
+
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single="<BOS> $A <EOS>",
+        pair="<BOS> $A <SEP> $B:1 <EOS>:1",
+        special_tokens=[
+            ("<BOS>", tokenizer.token_to_id("<BOS>")),
+            ("<SEP>", tokenizer.token_to_id("<SEP>")),
+            ("<EOS>", tokenizer.token_to_id("<EOS>")),
+        ],
     )
 
     print('Saving tokenizer...')

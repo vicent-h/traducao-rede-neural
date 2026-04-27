@@ -1,0 +1,3 @@
+O modelo v1 treinou bem, mas demoraria muito para continuar o treinamento
+O modelo v2 e v3 treinaram rápido mas chegaram rápido ao mínimo e overfitou demais, foi observado na loss que os gradientes do encoder foram sumindo, provavelmente por ser um modelo grande demais.
+Então na v4, aumentei o batch size do v1 para ver se melhorava.

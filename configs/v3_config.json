@@ -1,0 +1,21 @@
+{
+    "invert_src": true,
+    "embedding_dim": 256,
+    "encoder_hidden_dim": 1024,
+    "decoder_hidden_dim": 1024,
+    "encoder_num_layers": 2,
+    "decoder_num_layers": 2,
+    "encoder_dropout": 0.1,
+    "decoder_dropout": 0.3,
+    "encoder_bidirectional": true,
+    "batch_size": 256,
+    "accum_steps": 1,
+    "log_steps": 500,
+    "save_steps": 1000,
+    "eval_steps": 1000,
+    "device": "cuda",
+    "desc": "Adicionando dropout no decoder para evitar overfitting e vanishing",
+    "name": "v3",
+    "early_stop_patience": 5000,
+    "early_stop_min_delta": 0.0
+}

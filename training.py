@@ -13,6 +13,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import json
+from utils.warmup import WarmupScheduler
 
 logger = getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -44,6 +45,10 @@ def save_configs(args):
     json_args = vars(args)
     with open(f'configs/{model_name}_config.json', 'w', encoding='utf-8') as f:
         f.write(json.dumps(json_args, indent=4, ensure_ascii=False))
+
+def log_lr(optimizer: torch.optim.Optimizer, step_info: dict, writer: SummaryWriter):
+    writer.add_scalar("learning_rate", optimizer.param_groups[0]['lr'], step_info["step"])
+
         
 
 def train(
@@ -55,7 +60,8 @@ def train(
     train_config: dict,
     step_info: dict,
     writer: SummaryWriter,
-    early_stopper: EarlyStopper
+    early_stopper: EarlyStopper,
+    scheduler: WarmupScheduler
 ):
     stop = False
     for _ in range(int(1e6)):
@@ -65,7 +71,7 @@ def train(
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
 
-            loss = model.train_step(src, tgt, criterion, optimizer)
+            loss = model.train_step(src, tgt, criterion, optimizer, scheduler)
 
             step_info["loss_train"] += loss
             step_info["step"] += 1
@@ -75,6 +81,8 @@ def train(
                 writer.add_scalar("Loss/Train", step_info["loss_train"] / train_config["log_steps"], step_info["step"])
                 log_gradients(model, step_info, writer)
                 step_info["loss_train"] = 0
+
+                log_lr(optimizer, step_info, writer)
 
             if step_info["step"] % train_config["save_steps"] == 0:
                 os.makedirs("artifacts", exist_ok=True)
@@ -97,6 +105,10 @@ def train(
                     logger.info("Early stopping triggered.")
                     break
         if stop:
+            break
+        
+        if step_info["step"] >= train_config["max_steps"]:
+            logger.info("Max steps reached. Ending training.")
             break
 
 
@@ -121,6 +133,9 @@ if __name__ == "__main__":
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     args.add_argument("--early_stop_patience", type=int, default=5000)
     args.add_argument("--early_stop_min_delta", type=float, default=0.0)
+    args.add_argument("--warmup_steps", type=int, default=5000)
+    args.add_argument("--max_steps", type=int, default=200000)
+    args.add_argument("--learning_rate", type=float, default=1e-4)
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
@@ -160,7 +175,8 @@ if __name__ == "__main__":
     model = model.to(args.device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    scheduler = WarmupScheduler(optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps)
 
     train_config = {
         "batch_size": args.batch_size,
@@ -184,7 +200,7 @@ if __name__ == "__main__":
     save_configs(args)
 
     logger.info("Starting training loop...")
-    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper)
+    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper, scheduler)
 
 
 

@@ -80,7 +80,7 @@ class LSTM(nn.Module):
 
         return predictions
     
-    def train_step(self, src, tgt, criterion, optimizer):
+    def train_step(self, src, tgt, criterion, optimizer, scheduler):
         self.train()
         optimizer.zero_grad()
         output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
@@ -90,6 +90,7 @@ class LSTM(nn.Module):
         loss = criterion(output, tgt)
         loss.backward()
         optimizer.step()
+        scheduler.step()
         return loss.item()
     
     def eval_step(self, src, tgt, criterion):

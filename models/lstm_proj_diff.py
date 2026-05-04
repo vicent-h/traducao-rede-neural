@@ -3,7 +3,7 @@ import torch.nn as nn
 import logging
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO)
 
 class LSTM(nn.Module):
     def __init__(
@@ -38,10 +38,14 @@ class LSTM(nn.Module):
             batch_first=True
         )
 
-        self.proj_hidden = nn.Linear(
-            encoder_hidden_dim * 2 * encoder_num_layers if encoder_bidirectional 
-            else encoder_hidden_dim * encoder_num_layers, 
-            decoder_hidden_dim*decoder_num_layers
+        num_directions = 2 if encoder_bidirectional else 1
+
+        self.proj_hidden_h = nn.Linear(
+            encoder_hidden_dim * num_directions, decoder_hidden_dim
+        )
+
+        self.proj_hidden_c = nn.Linear(
+            encoder_hidden_dim * num_directions, decoder_hidden_dim
         )
 
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
@@ -55,25 +59,56 @@ class LSTM(nn.Module):
         embedded_src = self.embedding(src)
         embedded_tgt = self.embedding(tgt)
 
-        # embedded_src: [src_len, batch_size, embedding_dim]
-        # embedded_tgt: [tgt_len, batch_size, embedding_dim]
 
-        encoder_outputs, (h, c) = self.encoder(embedded_src)
+        logger.info(f"Embedded src shape: {embedded_src.shape}")
+        logger.info(f"Embedded tgt shape: {embedded_tgt.shape}")
+
+        # embedded_src: [batch_size, src_len, embedding_dim]
+        # embedded_tgt: [batch_size, tgt_len, embedding_dim]
+
+        _, (h, c) = self.encoder(embedded_src)
         h: torch.Tensor
         c: torch.Tensor
+
+        logger.info(f"Encoder hidden state shape: {h.shape}")
+        logger.info(f"Encoder cell state shape: {c.shape}")
 
         # encoder_outputs: [src_len, batch_size, encoder_hidden_dim * num_directions]
         # hidden: [encoder_num_layers * num_directions, batch_size, encoder_hidden_dim]
         # cell: [encoder_num_layers * num_directions, batch_size, encoder_hidden_dim]
-        h = h.view(h.size(1), -1) # [batch_size, encoder_hidden_dim * num_directions]
-        c = c.view(c.size(1), -1) # [batch_size, encoder_hidden_dim * num_directions]
-        h = self.proj_hidden(h)
-        c = self.proj_hidden(c)
+        num_directions = 2 if self.encoder.bidirectional else 1
+        batch_size = h.size(1)
+
+        h = h.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
+        c = c.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
+
+
+        h = h.permute(0, 2, 1, 3).reshape(self.encoder.num_layers, batch_size, -1)
+        c = c.permute(0, 2, 1, 3).reshape(self.encoder.num_layers, batch_size, -1)
+
+        logger.info(f"Reshaped encoder hidden state shape: {h.shape}")
+        logger.info(f"Reshaped encoder cell state shape: {c.shape}")
+
+        # h = h.sum(dim=1)
+        # c = c.sum(dim=1)
+
+        logger.info(f"Summed encoder hidden state shape: {h.shape}")
+        logger.info(f"Summed encoder cell state shape: {c.shape}")  
+
+        if self.encoder.num_layers != self.decoder.num_layers:
+            h = h[-self.decoder.num_layers:]
+            c = c[-self.decoder.num_layers:]
+
+        logger.info(f"Trimmed encoder hidden state shape: {h.shape}")
+        logger.info(f"Trimmed encoder cell state shape: {c.shape}")
+
+        h = self.proj_hidden_h(h)
+        c = self.proj_hidden_c(c)
+
+        logger.info(f"Projected encoder hidden state shape: {h.shape}")
+        logger.info(f"Projected encoder cell state shape: {c.shape}")
 
         # hidden: [batch_size, decoder_hidden_dim]
-
-        h = h.view(h.size(0), self.decoder.num_layers, -1).permute(1, 0, 2) # [decoder_num_layers, batch_size, decoder_hidden_dim]
-        c = c.view(c.size(0), self.decoder.num_layers, -1).permute(1, 0, 2) # [decoder_num_layers, batch_size, decoder_hidden_dim]
 
         outputs, _ = self.decoder(embedded_tgt, (h.contiguous(), c.contiguous()))
         # outputs: [tgt_len, batch_size, decoder_hidden_dim]
@@ -95,7 +130,9 @@ class LSTM(nn.Module):
         optimizer.zero_grad()
         output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
         output_dim = output.shape[-1] # (vocab_size)
-        output = output.view(-1, output_dim) # [tgt_len * batch_size, vocab_size]
+        
+        output = output.reshape(-1, output_dim) # [batch_size, tgt_len, decoder_hidden_dim]
+
         tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
         loss: torch.Tensor = criterion(output, tgt)
         return loss
@@ -105,7 +142,7 @@ class LSTM(nn.Module):
         with torch.no_grad():
             output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
             output_dim = output.shape[-1] # (vocab_size)
-            output = output.view(-1, output_dim) # [tgt_len * batch_size, vocab_size]
+            output = output.view(-1, output_dim) # [batch_size, tgt_len, decoder_hidden_dim]
             tgt = tgt[:, 1:].reshape(-1) # [tgt_len * batch_size]
             loss = criterion(output, tgt)
         return loss.item()

@@ -3,7 +3,7 @@ from datetime import datetime
 from torch.utils.data import DataLoader
 import logging
 import os
-from models.lstm import LSTM
+from models.lstm_proj_diff import LSTM
 from utils.dataset import TranslateDataset
 from utils.earlystopper import EarlyStopper
 import pandas as pd
@@ -71,9 +71,14 @@ def train(
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
 
-            loss = model.train_step(src, tgt, criterion, optimizer, scheduler)
+            loss: torch.Tensor = model.train_step(src, tgt, criterion, optimizer)
+            loss.backward()
 
-            step_info["loss_train"] += loss
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            optimizer.step()
+            scheduler.step()
+
+            step_info["loss_train"] += loss.item()
             step_info["step"] += 1
 
             if step_info["step"] % train_config["log_steps"] == 0:
@@ -131,7 +136,7 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    args.add_argument("--early_stop_patience", type=int, default=5000)
+    args.add_argument("--early_stop_patience", type=int, default=20)
     args.add_argument("--early_stop_min_delta", type=float, default=0.0)
     args.add_argument("--warmup_steps", type=int, default=5000)
     args.add_argument("--max_steps", type=int, default=200000)
@@ -184,7 +189,8 @@ if __name__ == "__main__":
         "log_steps": args.log_steps,
         "save_steps": args.save_steps,
         "eval_steps": args.eval_steps,
-        "device": args.device
+        "device": args.device,
+        "max_steps": args.max_steps
     }
 
     step_info = {

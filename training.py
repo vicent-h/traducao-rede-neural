@@ -29,6 +29,13 @@ def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLos
 
             step_info["loss_eval"] += loss
 
+def init_params(model: nn.Module):
+    for name, param in model.named_parameters():
+        if 'weight' in name:
+            nn.init.xavier_uniform_(param)
+        elif 'bias' in name:
+            nn.init.zeros_(param)
+
 def log_gradients(model: nn.Module, step_info: dict, writer: SummaryWriter):
     total_norm = 0
     for name, param in model.named_parameters():
@@ -178,6 +185,8 @@ if __name__ == "__main__":
         pad_idx=0
     )
     model = model.to(args.device)
+
+    init_params(model)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)

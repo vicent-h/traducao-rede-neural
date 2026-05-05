@@ -5,8 +5,8 @@
     "decoder_hidden_dim": 2048,
     "encoder_num_layers": 3,
     "decoder_num_layers": 3,
-    "encoder_dropout": 0.0,
-    "decoder_dropout": 0.0,
+    "encoder_dropout": 0.1,
+    "decoder_dropout": 0.1,
     "encoder_bidirectional": true,
     "batch_size": 64,
     "accum_steps": 1,
@@ -14,11 +14,11 @@
     "save_steps": 1000,
     "eval_steps": 1000,
     "device": "cuda",
-    "desc": "Aumentando learning rate e adicionando clip do gradient em 1.5",
+    "desc": "CLippando gradiente e inicializando os params uniformemente",
     "name": "v12",
     "early_stop_patience": 20,
     "early_stop_min_delta": 0.0,
     "warmup_steps": 25000,
-    "max_steps": 200000,
-    "learning_rate": 5e-05
+    "max_steps": 400000,
+    "learning_rate": 0.0001
 }

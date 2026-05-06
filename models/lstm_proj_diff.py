@@ -6,8 +6,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Add handler to output logs to console
-handler = logging.StreamHandler()
-logger.addHandler(handler)
+# handler = logging.StreamHandler()
+# logger.addHandler(handler)
 
 class LSTM(nn.Module):
     def __init__(

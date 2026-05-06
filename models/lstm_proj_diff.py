@@ -3,7 +3,11 @@ import torch.nn as nn
 import logging
 
 logger = logging.getLogger()
-# logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO)
+
+# Add handler to output logs to console
+handler = logging.StreamHandler()
+logger.addHandler(handler)
 
 class LSTM(nn.Module):
     def __init__(
@@ -52,26 +56,26 @@ class LSTM(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
 
-    def forward(self, src, tgt):
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor):
         # src: [batch_size, src_len]
         # tgt: [batch_size, tgt_len]
 
-        embedded_src = self.embedding(src)
+        logger.info(f'Src shape: {src.shape}') # torch.Size([64, 45])
+        logger.info(f'Tgt shape: {tgt.shape}') # torch.Size([64, 45])
+
+        embedded_src = self.embedding(src) 
         embedded_tgt = self.embedding(tgt)
 
 
-        logger.info(f"Embedded src shape: {embedded_src.shape}")
-        logger.info(f"Embedded tgt shape: {embedded_tgt.shape}")
-
-        # embedded_src: [batch_size, src_len, embedding_dim]
-        # embedded_tgt: [batch_size, tgt_len, embedding_dim]
+        logger.info(f"Embedded src shape: {embedded_src.shape}") # torch.Size([64, 45, 768])
+        logger.info(f"Embedded tgt shape: {embedded_tgt.shape}") # torch.Size([64, 45, 768])
 
         _, (h, c) = self.encoder(embedded_src)
         h: torch.Tensor
         c: torch.Tensor
 
-        logger.info(f"Encoder hidden state shape: {h.shape}")
-        logger.info(f"Encoder cell state shape: {c.shape}")
+        logger.info(f"Encoder hidden state shape: {h.shape}") # torch.Size([6, 64, 2048])
+        logger.info(f"Encoder cell state shape: {c.shape}") # torch.Size([6, 64, 2048])
 
         # encoder_outputs: [src_len, batch_size, encoder_hidden_dim * num_directions]
         # hidden: [encoder_num_layers * num_directions, batch_size, encoder_hidden_dim]
@@ -82,40 +86,40 @@ class LSTM(nn.Module):
         h = h.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
         c = c.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
 
+        h = h[-1]  # [num_directions, batch, hidden]
+        c = c[-1] # [num_directions, batch, hidden]
 
-        h = h.permute(0, 2, 1, 3).reshape(self.encoder.num_layers, batch_size, -1)
-        c = c.permute(0, 2, 1, 3).reshape(self.encoder.num_layers, batch_size, -1)
+        logger.info(f"Reshaped encoder hidden state shape: {h.shape}") # torch.Size([2, 64, 2048])
+        logger.info(f"Reshaped encoder cell state shape: {c.shape}") # torch.Size([2, 64, 2048])
 
-        logger.info(f"Reshaped encoder hidden state shape: {h.shape}")
-        logger.info(f"Reshaped encoder cell state shape: {c.shape}")
+        h = h.permute(1, 0, 2).reshape(batch_size, -1)
+        c = c.permute(1, 0, 2).reshape(batch_size, -1)
 
-        # h = h.sum(dim=1)
-        # c = c.sum(dim=1)
+        logger.info(f"Reshaped encoder hidden state shape: {h.shape}") # torch.Size([64, 4096])
+        logger.info(f"Reshaped encoder cell state shape: {c.shape}") # torch.Size([64, 4096])
 
-        logger.info(f"Summed encoder hidden state shape: {h.shape}")
-        logger.info(f"Summed encoder cell state shape: {c.shape}")  
+        # projeta
+        h = self.proj_hidden_h(h).unsqueeze(0)
+        c = self.proj_hidden_c(c).unsqueeze(0)
 
-        if self.encoder.num_layers != self.decoder.num_layers:
-            h = h[-self.decoder.num_layers:]
-            c = c[-self.decoder.num_layers:]
+        logger.info(f'Projected encoder to decoder hidden state shape: {h.shape}') # torch.Size(1, 64, 2048)
+        logger.info(f'Projected encoder to decoder cell state shape: {c.shape}') # torch.Size(1, 64, 2048)
 
-        logger.info(f"Trimmed encoder hidden state shape: {h.shape}")
-        logger.info(f"Trimmed encoder cell state shape: {c.shape}")
+        # replica para todas as layers do decoder
+        h = h.repeat(self.decoder.num_layers, 1, 1)
+        c = c.repeat(self.decoder.num_layers, 1, 1)
 
-        h = self.proj_hidden_h(h)
-        c = self.proj_hidden_c(c)
-
-        logger.info(f"Projected encoder hidden state shape: {h.shape}")
-        logger.info(f"Projected encoder cell state shape: {c.shape}")
-
-        # hidden: [batch_size, decoder_hidden_dim]
+        logger.info(f"Projected encoder hidden state shape: {h.shape}") # torch.Size([3, 64, 2048])
+        logger.info(f"Projected encoder cell state shape: {c.shape}") # torch.Size([3, 64, 2048])
 
         outputs, _ = self.decoder(embedded_tgt, (h.contiguous(), c.contiguous()))
-        # outputs: [tgt_len, batch_size, decoder_hidden_dim]
+
+        logger.info(f"Decoder output shape: {outputs.shape}") # torch.Size([64, 44, 2048])
 
         predictions = self.fc_out(outputs)
 
-        # predictions: [tgt_len, batch_size, vocab_size]
+        logger.info(f"Prediction shape: {predictions.shape}") # torch.Size([64, 44, 10000])
+
 
         return predictions
     

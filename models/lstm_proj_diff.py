@@ -1,13 +1,16 @@
 import torch
 import torch.nn as nn
+from logging import getLogger
 import logging
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
 
-# Add handler to output logs to console
+logger = getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 # handler = logging.StreamHandler()
+# handler.setLevel(logging.INFO)
 # logger.addHandler(handler)
+
 
 class LSTM(nn.Module):
     def __init__(
@@ -56,70 +59,125 @@ class LSTM(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
 
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor):
-        # src: [batch_size, src_len]
-        # tgt: [batch_size, tgt_len]
+    def encode(self, src):
 
-        logger.info(f'Src shape: {src.shape}') # torch.Size([64, 45])
-        logger.info(f'Tgt shape: {tgt.shape}') # torch.Size([64, 45])
+        logger.debug(f'Src shape: {src.shape}')  # [batch_size, src_len]
 
-        embedded_src = self.embedding(src) 
-        embedded_tgt = self.embedding(tgt)
+        embedded_src = self.embedding(src)
 
-
-        logger.info(f"Embedded src shape: {embedded_src.shape}") # torch.Size([64, 45, 768])
-        logger.info(f"Embedded tgt shape: {embedded_tgt.shape}") # torch.Size([64, 45, 768])
+        logger.debug(f'Embedded src shape: {embedded_src.shape}')
+        # [batch_size, src_len, embedding_dim]
 
         _, (h, c) = self.encoder(embedded_src)
-        h: torch.Tensor
-        c: torch.Tensor
 
-        logger.info(f"Encoder hidden state shape: {h.shape}") # torch.Size([6, 64, 2048])
-        logger.info(f"Encoder cell state shape: {c.shape}") # torch.Size([6, 64, 2048])
+        logger.debug(f'Encoder hidden state shape: {h.shape}')
+        logger.debug(f'Encoder cell state shape: {c.shape}')
+        # [num_layers * num_directions, batch_size, hidden_dim]
 
-        # encoder_outputs: [src_len, batch_size, encoder_hidden_dim * num_directions]
-        # hidden: [encoder_num_layers * num_directions, batch_size, encoder_hidden_dim]
-        # cell: [encoder_num_layers * num_directions, batch_size, encoder_hidden_dim]
-        num_directions = 2 if self.encoder.bidirectional else 1
-        batch_size = h.size(1)
+        # num_directions = 2 if self.encoder.bidirectional else 1
+        # batch_size = h.size(1)
 
-        h = h.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
-        c = c.view(self.encoder.num_layers, num_directions, batch_size, self.encoder.hidden_size)
+        # h = h.view(
+        #     self.encoder.num_layers,
+        #     num_directions,
+        #     batch_size,
+        #     self.encoder.hidden_size
+        # )
 
-        h = h[-1]  # [num_directions, batch, hidden]
-        c = c[-1] # [num_directions, batch, hidden]
+        # c = c.view(
+        #     self.encoder.num_layers,
+        #     num_directions,
+        #     batch_size,
+        #     self.encoder.hidden_size
+        # )
 
-        logger.info(f"Reshaped encoder hidden state shape: {h.shape}") # torch.Size([2, 64, 2048])
-        logger.info(f"Reshaped encoder cell state shape: {c.shape}") # torch.Size([2, 64, 2048])
+        # logger.debug(f'Reshaped encoder hidden state shape: {h.shape}')
+        # logger.debug(f'Reshaped encoder cell state shape: {c.shape}')
+        # # [num_layers, num_directions, batch_size, hidden_dim]
 
-        h = h.permute(1, 0, 2).reshape(batch_size, -1)
-        c = c.permute(1, 0, 2).reshape(batch_size, -1)
+        # # pega última layer
+        # h = h[-1]
+        # c = c[-1]
 
-        logger.info(f"Reshaped encoder hidden state shape: {h.shape}") # torch.Size([64, 4096])
-        logger.info(f"Reshaped encoder cell state shape: {c.shape}") # torch.Size([64, 4096])
+        # logger.debug(f'Last encoder hidden layer shape: {h.shape}')
+        # logger.debug(f'Last encoder cell layer shape: {c.shape}')
+        # # [num_directions, batch_size, hidden_dim]
+
+        # # concatena direções
+        # h = h.permute(1, 0, 2).reshape(batch_size, -1)
+        # c = c.permute(1, 0, 2).reshape(batch_size, -1)
+
+        if self.encoder.bidirectional:
+            h = torch.cat((h[-2], h[-1]), dim=1)
+            c = torch.cat((c[-2], c[-1]), dim=1)
+        else:
+            h = h[-1]
+            c = c[-1]
+
+        logger.debug(f'Concatenated encoder hidden shape: {h.shape}')
+        logger.debug(f'Concatenated encoder cell shape: {c.shape}')
+        # [batch_size, hidden_dim * num_directions]
 
         # projeta
         h = self.proj_hidden_h(h).unsqueeze(0)
         c = self.proj_hidden_c(c).unsqueeze(0)
 
-        logger.info(f'Projected encoder to decoder hidden state shape: {h.shape}') # torch.Size(1, 64, 2048)
-        logger.info(f'Projected encoder to decoder cell state shape: {c.shape}') # torch.Size(1, 64, 2048)
+        logger.debug(f'Projected encoder hidden shape: {h.shape}')
+        logger.debug(f'Projected encoder cell shape: {c.shape}')
+        # [1, batch_size, decoder_hidden_dim]
 
-        # replica para todas as layers do decoder
-        h = h.repeat(self.decoder.num_layers, 1, 1)
-        c = c.repeat(self.decoder.num_layers, 1, 1)
+        # replica nas layers do decoder
+        h = h.repeat(self.decoder.num_layers, 1, 1).contiguous()
+        c = c.repeat(self.decoder.num_layers, 1, 1).contiguous()
 
-        logger.info(f"Projected encoder hidden state shape: {h.shape}") # torch.Size([3, 64, 2048])
-        logger.info(f"Projected encoder cell state shape: {c.shape}") # torch.Size([3, 64, 2048])
+        logger.debug(f'Repeated decoder hidden shape: {h.shape}')
+        logger.debug(f'Repeated decoder cell shape: {c.shape}')
+        # [decoder_num_layers, batch_size, decoder_hidden_dim]
 
-        outputs, _ = self.decoder(embedded_tgt, (h.contiguous(), c.contiguous()))
+        return h, c
 
-        logger.info(f"Decoder output shape: {outputs.shape}") # torch.Size([64, 44, 2048])
+
+    def decode(self, tgt, h, c):
+
+        logger.debug(f'Tgt shape: {tgt.shape}')
+        # [batch_size, tgt_len]
+
+        logger.debug(f'Input decoder hidden shape: {h.shape}')
+        logger.debug(f'Input decoder cell shape: {c.shape}')
+
+        embedded_tgt = self.embedding(tgt)
+
+        logger.debug(f'Embedded tgt shape: {embedded_tgt.shape}')
+        # [batch_size, tgt_len, embedding_dim]
+
+        outputs, (h, c) = self.decoder(
+            embedded_tgt,
+            (h, c)
+        )
+
+        logger.debug(f'Decoder outputs shape: {outputs.shape}')
+        # [batch_size, tgt_len, decoder_hidden_dim]
+
+        logger.debug(f'Decoder hidden state shape: {h.shape}')
+        logger.debug(f'Decoder cell state shape: {c.shape}')
 
         predictions = self.fc_out(outputs)
 
-        logger.info(f"Prediction shape: {predictions.shape}") # torch.Size([64, 44, 10000])
+        logger.debug(f'Predictions shape: {predictions.shape}')
+        # [batch_size, tgt_len, vocab_size]
 
+        return predictions, h, c
+
+
+    def forward(self, src, tgt):
+
+        logger.debug('===== FORWARD START =====')
+
+        h, c = self.encode(src)
+
+        predictions, _, _ = self.decode(tgt, h, c)
+
+        logger.debug('===== FORWARD END =====')
 
         return predictions
     
@@ -131,11 +189,16 @@ class LSTM(nn.Module):
             optimizer: torch.optim.Optimizer
         ) -> torch.Tensor:
         self.train()
-        optimizer.zero_grad()
-        output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
+
+        logger.debug(f'src: {src[0, :]}')
+        logger.debug(f'tgt: {tgt[0, :-1]}')
+        logger.debug(f'tgt: {tgt[0, 1:]}')
+        output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
         output_dim = output.shape[-1] # (vocab_size)
         
-        output = output.reshape(-1, output_dim) # [batch_size, tgt_len, decoder_hidden_dim]
+        output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
+
+        logger.debug(f'Output shape after reshape train step: {output.shape}')
 
         tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
         loss: torch.Tensor = criterion(output, tgt)
@@ -144,9 +207,89 @@ class LSTM(nn.Module):
     def eval_step(self, src, tgt, criterion):
         self.eval()
         with torch.no_grad():
-            output = self(src, tgt[:, :-1]) # [tgt_len, batch_size, vocab_size]
-            output_dim = output.shape[-1] # (vocab_size)
-            output = output.view(-1, output_dim) # [batch_size, tgt_len, decoder_hidden_dim]
-            tgt = tgt[:, 1:].reshape(-1) # [tgt_len * batch_size]
+            output = self(src, tgt[:, :-1])
+            output_dim = output.shape[-1]
+            output = output.view(-1, output_dim)
+            tgt = tgt[:, 1:].reshape(-1)
             loss = criterion(output, tgt)
         return loss.item()
+    
+    def predict(
+        self,
+        src,
+        bos_token_id,
+        eos_token_id,
+        max_len=128
+    ):
+
+        self.eval()
+
+        # src -> [batch_size, src_seq_len]
+
+        batch_size = src.size(0)
+        device = src.device
+
+        with torch.no_grad():
+
+            h, c = self.encode(src)
+
+            # h -> [num_layers, batch_size, hidden_size]
+            # c -> [num_layers, batch_size, hidden_size]
+
+            current_tokens = torch.full(
+                (batch_size, 1),
+                bos_token_id,
+                dtype=torch.long,
+                device=device
+            )
+
+            # current_tokens -> [batch_size, 1]
+
+            generated_tokens = []
+
+            finished = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=device
+            )
+
+            # finished -> [batch_size]
+
+            for _ in range(max_len):
+
+                predictions, h, c = self.decode(
+                    current_tokens,
+                    h,
+                    c
+                )
+
+                # predictions -> [batch_size, 1, vocab_size]
+                # h -> [num_layers, batch_size, hidden_size]
+                # c -> [num_layers, batch_size, hidden_size]
+
+                next_token = predictions[:, -1].argmax(dim=-1)
+
+                # predictions[:, -1] -> [batch_size, vocab_size]
+                # next_token -> [batch_size]
+
+                generated_tokens.append(next_token)
+
+                # generated_tokens -> list de tensors [batch_size]
+
+                finished |= (next_token == eos_token_id)
+
+                # (next_token == eos_token_id) -> [batch_size]
+                # finished -> [batch_size]
+
+                if finished.all():
+                    break
+
+                current_tokens = next_token.unsqueeze(1)
+
+                # current_tokens -> [batch_size, 1]
+
+            generated_tokens = torch.stack(generated_tokens, dim=1)
+
+            # generated_tokens -> [batch_size, generated_seq_len]
+
+            return generated_tokens

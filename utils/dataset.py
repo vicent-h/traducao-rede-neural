@@ -3,7 +3,7 @@ import torch
 
 
 class TranslateDataset(Dataset):
-    def __init__(self, tokens_src, tokens_tgt, invert_src=False, max_len=45):
+    def __init__(self, tokens_src, tokens_tgt, invert_src=False, max_len=60):
         self.tokens_src = tokens_src
         self.tokens_tgt = tokens_tgt
         self.invert_src = invert_src
@@ -13,12 +13,15 @@ class TranslateDataset(Dataset):
         return len(self.tokens_src)
     
     def __getitem__(self, idx):
+        
         if self.invert_src:
             src = self.tokens_src[idx][::-1].copy()
             tgt = self.tokens_tgt[idx]
         else:            
             src = self.tokens_src[idx]
             tgt = self.tokens_tgt[idx]
+
+        src = src[1:-1]
 
         src = list(src[:self.max_len])
         tgt = list(tgt[:self.max_len])

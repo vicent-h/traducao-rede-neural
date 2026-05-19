@@ -16,7 +16,11 @@ import json
 from utils.warmup import WarmupScheduler
 
 logger = getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+
+# handler = logging.StreamHandler()
+# handler.setLevel(logging.DEBUG)
+# logger.addHandler(handler)
 
 def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter):
     model.eval()
@@ -33,8 +37,7 @@ def init_params(model: nn.Module):
     for name, param in model.named_parameters():
         if 'weight' in name:
             nn.init.xavier_uniform_(param)
-        elif 'bias' in name:
-            nn.init.zeros_(param)
+    # pass
 
 def log_gradients(model: nn.Module, step_info: dict, writer: SummaryWriter):
     total_norm = 0
@@ -80,37 +83,40 @@ def train(
 
             loss: torch.Tensor = model.train_step(src, tgt, criterion, optimizer)
             loss.backward()
+            step_info["loss_train"] += loss.item()
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            # if step_info["step"] % train_config['accum_steps'] == 0:
             optimizer.step()
             scheduler.step()
-
-            step_info["loss_train"] += loss.item()
+            
             step_info["step"] += 1
 
             if step_info["step"] % train_config["log_steps"] == 0:
-                logger.info(f'Step {step_info["step"]} - Loss: {step_info["loss_train"] / train_config["log_steps"]:.4f}')
+                logger.debug(f'Step {step_info["step"]} - Loss: {step_info["loss_train"] / train_config["log_steps"]:.4f}')
                 writer.add_scalar("Loss/Train", step_info["loss_train"] / train_config["log_steps"], step_info["step"])
                 log_gradients(model, step_info, writer)
                 step_info["loss_train"] = 0
 
                 log_lr(optimizer, step_info, writer)
 
+            optimizer.zero_grad()
+
             if step_info["step"] % train_config["save_steps"] == 0:
                 os.makedirs("artifacts", exist_ok=True)
-                logger.info(f'Model saved at step {step_info["step"]}')
+                logger.debug(f'Model saved at step {step_info["step"]}')
 
             if step_info["step"] % train_config["eval_steps"] == 0:
                 eval(model, dataloader_eval, criterion, step_info, writer)
                 eval_loss = step_info["loss_eval"] / len(dataloader_eval)
-                logger.info(f'Step {step_info["step"]} - Eval Loss: {eval_loss:.4f}')
+                logger.debug(f'Step {step_info["step"]} - Eval Loss: {eval_loss:.4f}')
                 writer.add_scalar("Loss/Eval", eval_loss, step_info["step"])
                 step_info["loss_eval"] = 0
 
                 if eval_loss < step_info["best_eval_loss"]:
                     step_info["best_eval_loss"] = eval_loss
                     torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
-                    logger.info(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
+                    logger.debug(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
 
                 stop = early_stopper.step(eval_loss)
                 if stop:
@@ -206,7 +212,8 @@ if __name__ == "__main__":
         "loss_train": 0,
         "loss_eval": 0,
         "step": 0,
-        'best_eval_loss': float('inf')
+        'best_eval_loss': float('inf'),
+        'global_step': 0
     }
 
     writer = SummaryWriter(log_dir=f"runs/{args.name}")

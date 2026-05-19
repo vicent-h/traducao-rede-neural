@@ -7,21 +7,27 @@ df_train = pd.read_csv('data/train.csv')
 
 print('Declaring tokenizer...')
 for vocab_size in [500, 1000, 5000, 10000, 25000, 30000, 50000]:
-    tokenizer = Tokenizer(models.BPE(unk_token="<UNK>"))
+    tokenizer = Tokenizer(
+        models.BPE(
+            unk_token="<UNK>",
+            end_of_word_suffix="</w>"
+        )
+    )
 
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer.decoder = decoders.WordPiece(prefix="##")
+    tokenizer.decoder = decoders.BPEDecoder(suffix="</w>")
 
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
         min_frequency=2,
         special_tokens=["<PAD>", "<UNK>", "<CLS>", "<SEP>", "<MASK>", "<BOS>", "<EOS>"],
+        end_of_word_suffix="</w>",
     )
 
     print('Training tokenizer...')
     tokenizer.train_from_iterator(
         df_train['pt'].tolist() + df_train['en'].tolist(),
-        trainer=trainer
+        trainer=trainer,
     )
 
     tokenizer.post_processor = processors.TemplateProcessing(

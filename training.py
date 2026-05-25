@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from datetime import datetime
+from tokenizers import Tokenizer
 from torch.utils.data import DataLoader
 import logging
 import os
@@ -18,9 +19,9 @@ from utils.warmup import WarmupScheduler
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# handler = logging.StreamHandler()
-# handler.setLevel(logging.DEBUG)
-# logger.addHandler(handler)
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
 def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter):
     model.eval()
@@ -71,7 +72,8 @@ def train(
     step_info: dict,
     writer: SummaryWriter,
     early_stopper: EarlyStopper,
-    scheduler: WarmupScheduler
+    scheduler: WarmupScheduler,
+    tokenizer: Tokenizer = None
 ):
     stop = False
     for _ in range(int(1e6)):
@@ -80,6 +82,13 @@ def train(
             tgt: torch.Tensor
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
+            if tokenizer:
+                logger.debug(f'Src tokens: {src[0]}')
+                logger.debug(f'Src: {tokenizer.decode(src[0].cpu().numpy(), False)}')
+                logger.debug(f'Tgt tokens: {tgt[0, :-1]}')
+                logger.debug(f'Tgt: {tokenizer.decode(tgt[0].cpu().numpy(), False)}')
+                logger.debug(f'Tgt tokens shifted: {tgt[0, 1:]}')
+                logger.debug(f'Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}')
 
             loss: torch.Tensor = model.train_step(src, tgt, criterion, optimizer)
             loss.backward()
@@ -113,10 +122,10 @@ def train(
                 writer.add_scalar("Loss/Eval", eval_loss, step_info["step"])
                 step_info["loss_eval"] = 0
 
-                if eval_loss < step_info["best_eval_loss"]:
-                    step_info["best_eval_loss"] = eval_loss
-                    torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
-                    logger.debug(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
+                # if eval_loss < step_info["best_eval_loss"]:
+                step_info["best_eval_loss"] = eval_loss
+                torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
+                logger.debug(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
 
                 stop = early_stopper.step(eval_loss)
                 if stop:
@@ -149,29 +158,33 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    args.add_argument("--early_stop_patience", type=int, default=20)
+    args.add_argument("--early_stop_patience", type=int, default=50000)
     args.add_argument("--early_stop_min_delta", type=float, default=0.0)
     args.add_argument("--warmup_steps", type=int, default=5000)
-    args.add_argument("--max_steps", type=int, default=200000)
+    args.add_argument("--max_steps", type=int, default=500000)
     args.add_argument("--learning_rate", type=float, default=1e-4)
+    args.add_argument("--vocab_size", type=int, default=50000)
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
-    df_train = pd.read_parquet("data/tokenized_train.parquet")
+    df_train = pd.read_parquet("data/tokenized_train.parquet").sample(100, random_state=42).reset_index(drop=True)
+    df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
 
     logger.info("Creating dataset...")
     dataset = TranslateDataset(
-        tokens_src=df_train['en_tokens'].tolist(),
-        tokens_tgt=df_train['pt_tokens'].tolist(),
+        tokens_src=df_train[f'en_tokens_{args.vocab_size}'].tolist(),
+        tokens_tgt=df_train[f'pt_tokens_{args.vocab_size}'].tolist(),
         invert_src=args.invert_src
     )
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
+    tokenizer = Tokenizer.from_file(f'artifacts/tokenizer_{args.vocab_size}.json')
+
     dataset_eval = TranslateDataset(
-        tokens_src=df_eval['en_tokens'].tolist(),
-        tokens_tgt=df_eval['pt_tokens'].tolist(),
+        tokens_src=df_eval[f'en_tokens_{args.vocab_size}'].tolist(),
+        tokens_tgt=df_eval[f'pt_tokens_{args.vocab_size}'].tolist(),
         invert_src=args.invert_src
     )
 
@@ -187,7 +200,7 @@ if __name__ == "__main__":
         encoder_dropout=args.encoder_dropout,
         decoder_dropout=args.decoder_dropout,
         encoder_bidirectional=args.encoder_bidirectional,
-        vocab_size=10000,
+        vocab_size=args.vocab_size,
         pad_idx=0
     )
     model = model.to(args.device)
@@ -222,7 +235,7 @@ if __name__ == "__main__":
     save_configs(args)
 
     logger.info("Starting training loop...")
-    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper, scheduler)
+    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper, scheduler, tokenizer)
 
 
 

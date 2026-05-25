@@ -12,15 +12,15 @@ datasets = {
     'test': df_test, 
     'eval': df_eval}
 
-tokenizer: Tokenizer = Tokenizer.from_file('artifacts/tokenizer_10000.json')
-
 for name, dataset in datasets.items():
-    print(f'Tokenizing {name}')
-    
-    tqdm.pandas(desc=f'Tokenizing EN')
-    dataset['en_tokens'] = dataset.en.progress_apply(lambda x: tokenizer.encode(x).ids)
-    tqdm.pandas(desc=f'Tokenizing PT')
-    dataset['pt_tokens'] = dataset.pt.progress_apply(lambda x: tokenizer.encode(x).ids)
-    
-    print('Exemplo: ', dataset['en_tokens'].iloc[0], '->', dataset['pt_tokens'].iloc[0])
+    for vocab_size in [10000, 50000]:
+        tokenizer: Tokenizer = Tokenizer.from_file(f'artifacts/tokenizer_{vocab_size}.json')
+        print(f'Tokenizing {name}')
+        
+        tqdm.pandas(desc=f'Tokenizing EN')
+        dataset[f'en_tokens_{vocab_size}'] = dataset.en.progress_apply(lambda x: tokenizer.encode(x).ids)
+        tqdm.pandas(desc=f'Tokenizing PT')
+        dataset[f'pt_tokens_{vocab_size}'] = dataset.pt.progress_apply(lambda x: tokenizer.encode(x).ids)
+        
+        print('Exemplo: ', dataset[f'en_tokens_{vocab_size}'].iloc[0], '->', dataset[f'pt_tokens_{vocab_size}'].iloc[0])
     dataset.to_parquet(f'data/tokenized_{name}.parquet', index=False)

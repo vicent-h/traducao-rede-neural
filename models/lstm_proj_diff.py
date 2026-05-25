@@ -7,9 +7,9 @@ import logging
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# handler = logging.StreamHandler()
-# handler.setLevel(logging.INFO)
-# logger.addHandler(handler)
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+logger.addHandler(handler)
 
 
 class LSTM(nn.Module):
@@ -190,9 +190,7 @@ class LSTM(nn.Module):
         ) -> torch.Tensor:
         self.train()
 
-        logger.debug(f'src: {src[0, :]}')
-        logger.debug(f'tgt: {tgt[0, :-1]}')
-        logger.debug(f'tgt: {tgt[0, 1:]}')
+        
         output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
         output_dim = output.shape[-1] # (vocab_size)
         

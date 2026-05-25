@@ -21,7 +21,7 @@ class TranslateDataset(Dataset):
             src = self.tokens_src[idx]
             tgt = self.tokens_tgt[idx]
 
-        src = src[1:-1]
+        src = src[1:]  # Remove <BOS>
 
         src = list(src[:self.max_len])
         tgt = list(tgt[:self.max_len])

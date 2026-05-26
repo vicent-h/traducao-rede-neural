@@ -19,11 +19,11 @@ from utils.warmup import WarmupScheduler
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
+# handler = logging.StreamHandler()
+# handler.setLevel(logging.DEBUG)
+# logger.addHandler(handler)
 
-def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter):
+def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter, train_config: dict):
     model.eval()
     with torch.no_grad():
         for src, tgt in tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
@@ -44,10 +44,10 @@ def log_gradients(model: nn.Module, step_info: dict, writer: SummaryWriter):
     total_norm = 0
     for name, param in model.named_parameters():
         if param.grad is not None:
-            writer.add_scalar(f"gradients/{name}", param.grad.norm().item(), step_info["step"])
+            writer.add_scalar(f"gradients/{name}", param.grad.norm().item(), step_info["global_step"])
             total_norm += param.grad.norm().item() ** 2
     total_norm = total_norm ** 0.5
-    writer.add_scalar("gradients/total_norm", total_norm, step_info["step"])
+    writer.add_scalar("gradients/total_norm", total_norm, step_info["global_step"])
 
 def save_configs(args):
     os.makedirs("configs", exist_ok=True)
@@ -58,7 +58,7 @@ def save_configs(args):
         f.write(json.dumps(json_args, indent=4, ensure_ascii=False))
 
 def log_lr(optimizer: torch.optim.Optimizer, step_info: dict, writer: SummaryWriter):
-    writer.add_scalar("learning_rate", optimizer.param_groups[0]['lr'], step_info["step"])
+    writer.add_scalar("learning_rate", optimizer.param_groups[0]['lr'], step_info["global_step"])
 
         
 
@@ -91,50 +91,55 @@ def train(
                 logger.debug(f'Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}')
 
             loss: torch.Tensor = model.train_step(src, tgt, criterion, optimizer)
+            loss = loss / train_config["accum_steps"]
             loss.backward()
             step_info["loss_train"] += loss.item()
-
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
-            # if step_info["step"] % train_config['accum_steps'] == 0:
-            optimizer.step()
-            scheduler.step()
-            
+            step_info["loss_train_count"] += 1
             step_info["step"] += 1
 
-            if step_info["step"] % train_config["log_steps"] == 0:
-                logger.debug(f'Step {step_info["step"]} - Loss: {step_info["loss_train"] / train_config["log_steps"]:.4f}')
-                writer.add_scalar("Loss/Train", step_info["loss_train"] / train_config["log_steps"], step_info["step"])
-                log_gradients(model, step_info, writer)
-                step_info["loss_train"] = 0
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            if step_info["step"] % train_config['accum_steps'] == 0:
+                optimizer.step()
+                scheduler.step()
 
-                log_lr(optimizer, step_info, writer)
+                step_info["global_step"] += 1
+                
+                if step_info["global_step"] % train_config["log_steps"] == 0:
+                    avg_loss = step_info["loss_train"] / step_info["loss_train_count"]
+                    logger.debug(f'Step {step_info["global_step"]} - Loss: {avg_loss:.4f}')
+                    writer.add_scalar("Loss/Train", avg_loss, step_info["global_step"])
+                    log_gradients(model, step_info, writer)
+                    step_info["loss_train"] = 0
+                    step_info["loss_train_count"] = 0
 
-            optimizer.zero_grad()
+                    log_lr(optimizer, step_info, writer)
 
-            if step_info["step"] % train_config["save_steps"] == 0:
-                os.makedirs("artifacts", exist_ok=True)
-                logger.debug(f'Model saved at step {step_info["step"]}')
+                optimizer.zero_grad()
 
-            if step_info["step"] % train_config["eval_steps"] == 0:
-                eval(model, dataloader_eval, criterion, step_info, writer)
-                eval_loss = step_info["loss_eval"] / len(dataloader_eval)
-                logger.debug(f'Step {step_info["step"]} - Eval Loss: {eval_loss:.4f}')
-                writer.add_scalar("Loss/Eval", eval_loss, step_info["step"])
-                step_info["loss_eval"] = 0
+                if step_info["global_step"] % train_config["save_steps"] == 0:
+                    os.makedirs("artifacts", exist_ok=True)
+                    logger.debug(f'Model saved at step {step_info["global_step"]}')
 
-                # if eval_loss < step_info["best_eval_loss"]:
-                step_info["best_eval_loss"] = eval_loss
-                torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
-                logger.debug(f'New best model saved at step {step_info["step"]} with eval loss {eval_loss:.4f}')
+                if step_info["global_step"] % train_config["eval_steps"] == 0:
+                    eval(model, dataloader_eval, criterion, step_info, writer, train_config)
+                    eval_loss = step_info["loss_eval"] / len(dataloader_eval)
+                    logger.debug(f'Step {step_info["global_step"]} - Eval Loss: {eval_loss:.4f}')
+                    writer.add_scalar("Loss/Eval", eval_loss, step_info["global_step"])
+                    step_info["loss_eval"] = 0
 
-                stop = early_stopper.step(eval_loss)
-                if stop:
-                    logger.info("Early stopping triggered.")
-                    break
-        if stop:
-            break
+                    # if eval_loss < step_info["best_eval_loss"]:
+                    step_info["best_eval_loss"] = eval_loss
+                    torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
+                    logger.debug(f'New best model saved at step {step_info["global_step"]} with eval loss {eval_loss:.4f}')
+
+                    stop = early_stopper.step(eval_loss)
+                    if stop:
+                        logger.info("Early stopping triggered.")
+                        break
+            if stop:
+                break
         
-        if step_info["step"] >= train_config["max_steps"]:
+        if step_info["global_step"] >= train_config["max_steps"]:
             logger.info("Max steps reached. Ending training.")
             break
 
@@ -164,18 +169,19 @@ if __name__ == "__main__":
     args.add_argument("--max_steps", type=int, default=500000)
     args.add_argument("--learning_rate", type=float, default=1e-4)
     args.add_argument("--vocab_size", type=int, default=50000)
+    args.add_argument("--max_len", type=int, default=60)
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
-    df_train = pd.read_parquet("data/tokenized_train.parquet").sample(100, random_state=42).reset_index(drop=True)
-    df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
+    df_train = pd.read_parquet("data/tokenized_train.parquet")
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
 
     logger.info("Creating dataset...")
     dataset = TranslateDataset(
         tokens_src=df_train[f'en_tokens_{args.vocab_size}'].tolist(),
         tokens_tgt=df_train[f'pt_tokens_{args.vocab_size}'].tolist(),
-        invert_src=args.invert_src
+        invert_src=args.invert_src,
+        max_len=args.max_len
     )
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -185,7 +191,8 @@ if __name__ == "__main__":
     dataset_eval = TranslateDataset(
         tokens_src=df_eval[f'en_tokens_{args.vocab_size}'].tolist(),
         tokens_tgt=df_eval[f'pt_tokens_{args.vocab_size}'].tolist(),
-        invert_src=args.invert_src
+        invert_src=args.invert_src,
+        max_len=args.max_len
     )
 
     dataloader_eval = DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False)
@@ -223,6 +230,7 @@ if __name__ == "__main__":
 
     step_info = {
         "loss_train": 0,
+        "loss_train_count": 0,
         "loss_eval": 0,
         "step": 0,
         'best_eval_loss': float('inf'),

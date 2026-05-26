@@ -7,9 +7,9 @@ import logging
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-logger.addHandler(handler)
+# handler = logging.StreamHandler()
+# handler.setLevel(logging.DEBUG)
+# logger.addHandler(handler)
 
 
 class LSTM(nn.Module):
@@ -34,7 +34,7 @@ class LSTM(nn.Module):
             num_layers=encoder_num_layers,
             dropout=encoder_dropout,
             bidirectional=encoder_bidirectional,
-            batch_first=True
+            batch_first=False
         )
 
         self.decoder = nn.LSTM(
@@ -42,7 +42,7 @@ class LSTM(nn.Module):
             decoder_hidden_dim,
             num_layers=decoder_num_layers,
             dropout=decoder_dropout,
-            batch_first=True
+            batch_first=False
         )
 
         num_directions = 2 if encoder_bidirectional else 1
@@ -64,48 +64,15 @@ class LSTM(nn.Module):
         logger.debug(f'Src shape: {src.shape}')  # [batch_size, src_len]
 
         embedded_src = self.embedding(src)
+        embedded_src = embedded_src.permute(1, 0, 2)
 
         logger.debug(f'Embedded src shape: {embedded_src.shape}')
-        # [batch_size, src_len, embedding_dim]
+        # [src_len, batch_size, embedding_dim]
 
         _, (h, c) = self.encoder(embedded_src)
 
         logger.debug(f'Encoder hidden state shape: {h.shape}')
         logger.debug(f'Encoder cell state shape: {c.shape}')
-        # [num_layers * num_directions, batch_size, hidden_dim]
-
-        # num_directions = 2 if self.encoder.bidirectional else 1
-        # batch_size = h.size(1)
-
-        # h = h.view(
-        #     self.encoder.num_layers,
-        #     num_directions,
-        #     batch_size,
-        #     self.encoder.hidden_size
-        # )
-
-        # c = c.view(
-        #     self.encoder.num_layers,
-        #     num_directions,
-        #     batch_size,
-        #     self.encoder.hidden_size
-        # )
-
-        # logger.debug(f'Reshaped encoder hidden state shape: {h.shape}')
-        # logger.debug(f'Reshaped encoder cell state shape: {c.shape}')
-        # # [num_layers, num_directions, batch_size, hidden_dim]
-
-        # # pega última layer
-        # h = h[-1]
-        # c = c[-1]
-
-        # logger.debug(f'Last encoder hidden layer shape: {h.shape}')
-        # logger.debug(f'Last encoder cell layer shape: {c.shape}')
-        # # [num_directions, batch_size, hidden_dim]
-
-        # # concatena direções
-        # h = h.permute(1, 0, 2).reshape(batch_size, -1)
-        # c = c.permute(1, 0, 2).reshape(batch_size, -1)
 
         if self.encoder.bidirectional:
             h = torch.cat((h[-2], h[-1]), dim=1)
@@ -116,22 +83,28 @@ class LSTM(nn.Module):
 
         logger.debug(f'Concatenated encoder hidden shape: {h.shape}')
         logger.debug(f'Concatenated encoder cell shape: {c.shape}')
-        # [batch_size, hidden_dim * num_directions]
 
-        # projeta
-        h = self.proj_hidden_h(h).unsqueeze(0)
-        c = self.proj_hidden_c(c).unsqueeze(0)
+        h0 = self.proj_hidden_h(h).unsqueeze(0)
+        c0 = self.proj_hidden_c(c).unsqueeze(0)
 
-        logger.debug(f'Projected encoder hidden shape: {h.shape}')
-        logger.debug(f'Projected encoder cell shape: {c.shape}')
-        # [1, batch_size, decoder_hidden_dim]
+        logger.debug(f'Projected encoder hidden shape: {h0.shape}')
+        logger.debug(f'Projected encoder cell shape: {c0.shape}')
 
-        # replica nas layers do decoder
-        h = h.repeat(self.decoder.num_layers, 1, 1).contiguous()
-        c = c.repeat(self.decoder.num_layers, 1, 1).contiguous()
+        if self.decoder.num_layers > 1:
+            h = torch.cat([
+                h0,
+                h0.new_zeros(self.decoder.num_layers - 1, h0.size(1), h0.size(2))
+            ], dim=0).contiguous()
+            c = torch.cat([
+                c0,
+                c0.new_zeros(self.decoder.num_layers - 1, c0.size(1), c0.size(2))
+            ], dim=0).contiguous()
+        else:
+            h = h0
+            c = c0
 
-        logger.debug(f'Repeated decoder hidden shape: {h.shape}')
-        logger.debug(f'Repeated decoder cell shape: {c.shape}')
+        logger.debug(f'Decoder initial hidden shape: {h.shape}')
+        logger.debug(f'Decoder initial cell shape: {c.shape}')
         # [decoder_num_layers, batch_size, decoder_hidden_dim]
 
         return h, c
@@ -146,14 +119,17 @@ class LSTM(nn.Module):
         logger.debug(f'Input decoder cell shape: {c.shape}')
 
         embedded_tgt = self.embedding(tgt)
+        embedded_tgt = embedded_tgt.permute(1, 0, 2)
 
         logger.debug(f'Embedded tgt shape: {embedded_tgt.shape}')
-        # [batch_size, tgt_len, embedding_dim]
+        # [tgt_len, batch_size, embedding_dim]
 
         outputs, (h, c) = self.decoder(
             embedded_tgt,
             (h, c)
         )
+
+        outputs = outputs.permute(1, 0, 2)
 
         logger.debug(f'Decoder outputs shape: {outputs.shape}')
         # [batch_size, tgt_len, decoder_hidden_dim]

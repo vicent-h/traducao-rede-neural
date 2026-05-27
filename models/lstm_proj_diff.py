@@ -161,8 +161,7 @@ class LSTM(nn.Module):
             self, 
             src: torch.Tensor, 
             tgt: torch.Tensor, 
-            criterion: nn.CrossEntropyLoss, 
-            optimizer: torch.optim.Optimizer
+            criterion: nn.CrossEntropyLoss
         ) -> torch.Tensor:
         self.train()
 

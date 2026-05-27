@@ -15,6 +15,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import json
 from utils.warmup import WarmupScheduler
+import numpy as np
 
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -23,8 +24,9 @@ logger.setLevel(logging.DEBUG)
 # handler.setLevel(logging.DEBUG)
 # logger.addHandler(handler)
 
-def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter, train_config: dict):
+def eval(model: LSTM, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, step_info: dict, writer: SummaryWriter, train_config: dict, tokenizer: Tokenizer = None):
     model.eval()
+    printed_example = False
     with torch.no_grad():
         for src, tgt in tqdm(dataloader, desc="Evaluating", total=len(dataloader)):
             src = src.to(train_config["device"])
@@ -34,10 +36,44 @@ def eval(model: nn.Module, dataloader: DataLoader, criterion: nn.CrossEntropyLos
 
             step_info["loss_eval"] += loss
 
-def init_params(model: nn.Module):
+            if not printed_example:
+                index_to_print = np.random.randint(0, src.size(0))
+                # obtain model predictions (teacher-forced) and show first sample
+                preds_logits = model(src, tgt[:, :-1])
+                preds_ids = preds_logits.argmax(dim=-1)  # [batch, tgt_len]
+
+                ref_ids = tgt[:, 1:]
+
+                # log token ids
+                print(f'Example tgt ids passed to model: {tgt[index_to_print, :-1]}')
+                print(f"Example ref ids: {ref_ids[index_to_print]}")
+                print(f"Example pred ids: {preds_ids[index_to_print]}")
+                
+
+                if tokenizer is not None:
+                    try:
+                        ref_np = ref_ids[index_to_print].cpu().numpy()
+                        pred_np = preds_ids[index_to_print].cpu().numpy()
+                        print('Src decoded:', tokenizer.decode(src[index_to_print].cpu().numpy(), skip_special_tokens=False))
+                        print(f"Example ref decoded: {tokenizer.decode(ref_np, skip_special_tokens=False)}")
+                        print(f"Example pred decoded: {tokenizer.decode(pred_np, skip_special_tokens=False)}")
+                    except Exception:
+                        logger.exception("Failed to decode tokens with tokenizer")
+
+                printed_example = True
+
+def init_params(model: nn.Module, weight_init_method: str = None, bias_init_method: str = None):
     for name, param in model.named_parameters():
         if 'weight' in name:
-            nn.init.xavier_uniform_(param)
+            if weight_init_method == "xavier_uniform":
+                nn.init.xavier_uniform_(param)
+            elif weight_init_method == "xavier_normal":
+                nn.init.xavier_normal_(param)
+        if 'bias' in name and bias_init_method is not None:
+            if bias_init_method == "zeros":
+                nn.init.zeros_(param)
+            elif bias_init_method == "ones":
+                nn.init.ones_(param)
     # pass
 
 def log_gradients(model: nn.Module, step_info: dict, writer: SummaryWriter):
@@ -77,7 +113,9 @@ def train(
 ):
     stop = False
     for _ in range(int(1e6)):
-        for src, tgt in tqdm(dataloader, desc="Training", total=len(dataloader)):
+        # for src, tgt in tqdm(dataloader, desc="Training", total=len(dataloader)):
+        for src, tgt in dataloader:
+
             src: torch.Tensor
             tgt: torch.Tensor
             src = src.to(train_config["device"])
@@ -90,14 +128,15 @@ def train(
                 logger.debug(f'Tgt tokens shifted: {tgt[0, 1:]}')
                 logger.debug(f'Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}')
 
-            loss: torch.Tensor = model.train_step(src, tgt, criterion, optimizer)
+            loss: torch.Tensor = model.train_step(src, tgt, criterion)
             loss = loss / train_config["accum_steps"]
             loss.backward()
             step_info["loss_train"] += loss.item()
             step_info["loss_train_count"] += 1
             step_info["step"] += 1
 
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            if train_config["clip_grad"] is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=train_config["clip_grad"])
             if step_info["step"] % train_config['accum_steps'] == 0:
                 optimizer.step()
                 scheduler.step()
@@ -121,7 +160,7 @@ def train(
                     logger.debug(f'Model saved at step {step_info["global_step"]}')
 
                 if step_info["global_step"] % train_config["eval_steps"] == 0:
-                    eval(model, dataloader_eval, criterion, step_info, writer, train_config)
+                    eval(model, dataloader_eval, criterion, step_info, writer, train_config, tokenizer)
                     eval_loss = step_info["loss_eval"] / len(dataloader_eval)
                     logger.debug(f'Step {step_info["global_step"]} - Eval Loss: {eval_loss:.4f}')
                     writer.add_scalar("Loss/Eval", eval_loss, step_info["global_step"])
@@ -163,17 +202,21 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    args.add_argument("--early_stop_patience", type=int, default=50000)
+    args.add_argument("--early_stop_patience", type=int, default=10)
     args.add_argument("--early_stop_min_delta", type=float, default=0.0)
     args.add_argument("--warmup_steps", type=int, default=5000)
     args.add_argument("--max_steps", type=int, default=500000)
     args.add_argument("--learning_rate", type=float, default=1e-4)
     args.add_argument("--vocab_size", type=int, default=50000)
     args.add_argument("--max_len", type=int, default=60)
+    args.add_argument("--clip_grad", type=float, default=None)
+    args.add_argument("--init_weight_method", type=str, default=None, choices=["xavier_uniform", "xavier_normal"])
+    args.add_argument("--init_bias_method", type=str, default=None, choices=["zeros", "ones"])
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
-    df_train = pd.read_parquet("data/tokenized_train.parquet")
+    df_train = pd.read_parquet("data/tokenized_train.parquet")#.sample(n=2, random_state=42).reset_index(drop=True)
+    # df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
 
     logger.info("Creating dataset...")
@@ -212,7 +255,7 @@ if __name__ == "__main__":
     )
     model = model.to(args.device)
 
-    init_params(model)
+    init_params(model, weight_init_method=args.init_weight_method, bias_init_method=args.init_bias_method)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -225,7 +268,8 @@ if __name__ == "__main__":
         "save_steps": args.save_steps,
         "eval_steps": args.eval_steps,
         "device": args.device,
-        "max_steps": args.max_steps
+        "max_steps": args.max_steps,
+        "clip_grad": args.clip_grad
     }
 
     step_info = {

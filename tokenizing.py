@@ -19,8 +19,10 @@ for name, dataset in datasets.items():
         
         tqdm.pandas(desc=f'Tokenizing EN')
         dataset[f'en_tokens_{vocab_size}'] = dataset.en.progress_apply(lambda x: tokenizer.encode(x).ids)
+        dataset[f'en_tokens_{vocab_size}_len'] = dataset[f'en_tokens_{vocab_size}'].apply(len)
         tqdm.pandas(desc=f'Tokenizing PT')
         dataset[f'pt_tokens_{vocab_size}'] = dataset.pt.progress_apply(lambda x: tokenizer.encode(x).ids)
+        dataset[f'pt_tokens_{vocab_size}_len'] = dataset[f'pt_tokens_{vocab_size}'].apply(len)
         
         print('Exemplo: ', dataset[f'en_tokens_{vocab_size}'].iloc[0], '->', dataset[f'pt_tokens_{vocab_size}'].iloc[0])
     dataset.to_parquet(f'data/tokenized_{name}.parquet', index=False)

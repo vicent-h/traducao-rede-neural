@@ -128,7 +128,7 @@ def train(
                 logger.debug(f'Tgt tokens shifted: {tgt[0, 1:]}')
                 logger.debug(f'Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}')
 
-            loss: torch.Tensor = model.train_step(src, tgt, criterion)
+            loss: torch.Tensor = model.train_step(src, tgt, criterion, train_config["teacher_forcing"])
             loss = loss / train_config["accum_steps"]
             loss.backward()
             step_info["loss_train"] += loss.item()
@@ -212,19 +212,22 @@ if __name__ == "__main__":
     args.add_argument("--clip_grad", type=float, default=None)
     args.add_argument("--init_weight_method", type=str, default=None, choices=["xavier_uniform", "xavier_normal"])
     args.add_argument("--init_bias_method", type=str, default=None, choices=["zeros", "ones"])
+    args.add_argument("--no-teacher_forcing", dest="teacher_forcing", default=True, action="store_false")
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
     df_train = pd.read_parquet("data/tokenized_train.parquet")#.sample(n=2, random_state=42).reset_index(drop=True)
+    df_train = df_train.loc[df_train[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True)
     # df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
+    df_eval = df_eval.loc[df_eval[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True)
 
     logger.info("Creating dataset...")
     dataset = TranslateDataset(
         tokens_src=df_train[f'en_tokens_{args.vocab_size}'].tolist(),
         tokens_tgt=df_train[f'pt_tokens_{args.vocab_size}'].tolist(),
         invert_src=args.invert_src,
-        max_len=args.max_len
+        max_len=int(args.max_len*1.5)
     )
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -235,7 +238,7 @@ if __name__ == "__main__":
         tokens_src=df_eval[f'en_tokens_{args.vocab_size}'].tolist(),
         tokens_tgt=df_eval[f'pt_tokens_{args.vocab_size}'].tolist(),
         invert_src=args.invert_src,
-        max_len=args.max_len
+        max_len=int(args.max_len*1.5)
     )
 
     dataloader_eval = DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False)
@@ -269,7 +272,8 @@ if __name__ == "__main__":
         "eval_steps": args.eval_steps,
         "device": args.device,
         "max_steps": args.max_steps,
-        "clip_grad": args.clip_grad
+        "clip_grad": args.clip_grad,
+        "teacher_forcing": args.teacher_forcing
     }
 
     step_info = {

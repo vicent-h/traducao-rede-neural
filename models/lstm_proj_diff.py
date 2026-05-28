@@ -161,12 +161,39 @@ class LSTM(nn.Module):
             self, 
             src: torch.Tensor, 
             tgt: torch.Tensor, 
-            criterion: nn.CrossEntropyLoss
+            criterion: nn.CrossEntropyLoss,
+            teacher_forcing: bool = True,
+            bos_token_id: int = 5
         ) -> torch.Tensor:
         self.train()
 
-        
-        output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
+        if teacher_forcing:
+            output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
+        else:
+            batch_size = src.size(0)
+            max_len = tgt.size(1)
+            device = src.device
+            h, c = self.encode(src)
+            current_token = torch.full(
+                (batch_size, 1),
+                bos_token_id,
+                dtype=torch.long,
+                device=device
+            )
+
+            outputs = []
+
+            for _ in range(max_len - 1):
+                predictions, h, c = self.decode(
+                    current_token,
+                    h,
+                    c
+                )
+                outputs.append(predictions)
+                current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
+            output = torch.cat(outputs, dim=1)
+            
+
         output_dim = output.shape[-1] # (vocab_size)
         
         output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
@@ -209,14 +236,14 @@ class LSTM(nn.Module):
             # h -> [num_layers, batch_size, hidden_size]
             # c -> [num_layers, batch_size, hidden_size]
 
-            current_tokens = torch.full(
+            current_token = torch.full(
                 (batch_size, 1),
                 bos_token_id,
                 dtype=torch.long,
                 device=device
             )
 
-            # current_tokens -> [batch_size, 1]
+            # current_token -> [batch_size, 1]
 
             generated_tokens = []
 
@@ -231,7 +258,7 @@ class LSTM(nn.Module):
             for _ in range(max_len):
 
                 predictions, h, c = self.decode(
-                    current_tokens,
+                    current_token,
                     h,
                     c
                 )
@@ -257,9 +284,9 @@ class LSTM(nn.Module):
                 if finished.all():
                     break
 
-                current_tokens = next_token.unsqueeze(1)
+                current_token = next_token.unsqueeze(1)
 
-                # current_tokens -> [batch_size, 1]
+                # current_token -> [batch_size, 1]
 
             generated_tokens = torch.stack(generated_tokens, dim=1)
 

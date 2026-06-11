@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 import logging
 import os
 from models.lstm_proj_diff import LSTM
-from utils.dataset import TranslateDataset
+from utils.dataset import TranslateDataset, CurriculumLengthSampler
 from utils.earlystopper import EarlyStopper
 import pandas as pd
 from logging import getLogger
@@ -14,6 +14,10 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import json
+from utils.scheduler_sampling import (
+    LinearSchedulerSampling, SigmoidSchedulerSampling,
+    SchedulerSamplingLength
+)
 from utils.warmup import WarmupScheduler
 import numpy as np
 
@@ -96,7 +100,13 @@ def save_configs(args):
 def log_lr(optimizer: torch.optim.Optimizer, step_info: dict, writer: SummaryWriter):
     writer.add_scalar("learning_rate", optimizer.param_groups[0]['lr'], step_info["global_step"])
 
-        
+def log_teacher_forcing_ratio(scheduler_sampling: LinearSchedulerSampling, step_info: dict, writer: SummaryWriter):
+    writer.add_scalar("teacher_forcing_ratio", scheduler_sampling.get_ratio(), step_info["global_step"])
+
+def log_max_len(scheduler_sampling_length: SchedulerSamplingLength, step_info: dict, writer: SummaryWriter):
+    if scheduler_sampling_length.use:
+        max_len = scheduler_sampling_length.get_max_len(step_info["global_step"])
+        writer.add_scalar("max_len", max_len, step_info["global_step"])
 
 def train(
     model: LSTM, 
@@ -109,9 +119,12 @@ def train(
     writer: SummaryWriter,
     early_stopper: EarlyStopper,
     scheduler: WarmupScheduler,
-    tokenizer: Tokenizer = None
+    tokenizer: Tokenizer = None,
+    scheduler_sampling: LinearSchedulerSampling = None,
+    scheduler_sampling_length: SchedulerSamplingLength = None
 ):
     stop = False
+    log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
     for _ in range(int(1e6)):
         # for src, tgt in tqdm(dataloader, desc="Training", total=len(dataloader)):
         for src, tgt in dataloader:
@@ -128,7 +141,12 @@ def train(
                 logger.debug(f'Tgt tokens shifted: {tgt[0, 1:]}')
                 logger.debug(f'Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}')
 
-            loss: torch.Tensor = model.train_step(src, tgt, criterion, train_config["teacher_forcing"])
+            loss: torch.Tensor = model.train_step(
+                src, 
+                tgt, 
+                criterion, 
+                train_config["teacher_forcing"], 
+                scheduler_sampling=scheduler_sampling)
             loss = loss / train_config["accum_steps"]
             loss.backward()
             step_info["loss_train"] += loss.item()
@@ -140,6 +158,7 @@ def train(
             if step_info["step"] % train_config['accum_steps'] == 0:
                 optimizer.step()
                 scheduler.step()
+                scheduler_sampling.step()
 
                 step_info["global_step"] += 1
                 
@@ -152,6 +171,8 @@ def train(
                     step_info["loss_train_count"] = 0
 
                     log_lr(optimizer, step_info, writer)
+                    log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
+                    log_max_len(scheduler_sampling_length, step_info, writer)
 
                 optimizer.zero_grad()
 
@@ -213,6 +234,9 @@ if __name__ == "__main__":
     args.add_argument("--init_weight_method", type=str, default=None, choices=["xavier_uniform", "xavier_normal"])
     args.add_argument("--init_bias_method", type=str, default=None, choices=["zeros", "ones"])
     args.add_argument("--no-teacher_forcing", dest="teacher_forcing", default=True, action="store_false")
+    args.add_argument("--scheduler_sampling", default=False, action="store_true")
+    args.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
+    args.add_argument("--max_steps_scheduler_sampling", type=int, default=50000)
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
@@ -220,7 +244,7 @@ if __name__ == "__main__":
     df_train = df_train.loc[df_train[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True)
     # df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
-    df_eval = df_eval.loc[df_eval[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True)
+    df_eval = df_eval.loc[df_eval[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True).sample(frac=0.1, random_state=42)
 
     logger.info("Creating dataset...")
     dataset = TranslateDataset(
@@ -263,6 +287,23 @@ if __name__ == "__main__":
     criterion = nn.CrossEntropyLoss(ignore_index=0)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = WarmupScheduler(optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps)
+    scheduler_sampling = SigmoidSchedulerSampling(
+        teacher_forcing_ratio=args.teacher_forcing_ratio, 
+        max_steps=args.max_steps_scheduler_sampling, 
+        use=args.scheduler_sampling
+    )
+
+    list_dicts_len = [
+        {"max_step": 25000, "max_len": 10},
+        {"max_step": 50000, "max_len": 20},
+        {"max_step": 100000, "max_len": 40},
+        {"max_step": 500000, "max_len": 54},
+    ]
+
+    scheduler_sampling_length = SchedulerSamplingLength(
+        list_dicts_len=list_dicts_len,
+        use=args.scheduler_sampling_length
+    )
 
     train_config = {
         "batch_size": args.batch_size,
@@ -291,7 +332,21 @@ if __name__ == "__main__":
     save_configs(args)
 
     logger.info("Starting training loop...")
-    train(model, dataloader, dataloader_eval, criterion, optimizer, train_config, step_info, writer, early_stopper, scheduler, tokenizer)
+    train(
+        model, 
+        dataloader, 
+        dataloader_eval, 
+        criterion, 
+        optimizer, 
+        train_config, 
+        step_info, 
+        writer, 
+        early_stopper, 
+        scheduler, 
+        tokenizer,
+        scheduler_sampling,
+        scheduler_sampling_length
+    )
 
 
 

@@ -3,6 +3,8 @@ import torch.nn as nn
 from logging import getLogger
 import logging
 
+from utils.scheduler_sampling import LinearSchedulerSampling
+
 
 logger = getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -163,11 +165,12 @@ class LSTM(nn.Module):
             tgt: torch.Tensor, 
             criterion: nn.CrossEntropyLoss,
             teacher_forcing: bool = True,
-            bos_token_id: int = 5
+            bos_token_id: int = 5,
+            scheduler_sampling: LinearSchedulerSampling = None
         ) -> torch.Tensor:
         self.train()
 
-        if teacher_forcing:
+        if teacher_forcing and scheduler_sampling.get_ratio() >= 0.99:
             output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
         else:
             batch_size = src.size(0)
@@ -183,14 +186,19 @@ class LSTM(nn.Module):
 
             outputs = []
 
-            for _ in range(max_len - 1):
+            for t in range(max_len - 1):
                 predictions, h, c = self.decode(
                     current_token,
                     h,
                     c
                 )
                 outputs.append(predictions)
-                current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
+
+                truth_token = tgt[:, t].unsqueeze(1)
+                if teacher_forcing and scheduler_sampling.should_sample():
+                    current_token = truth_token
+                else:
+                    current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
             output = torch.cat(outputs, dim=1)
             
 

@@ -15,8 +15,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import json
 from utils.scheduler_sampling import (
-    LinearSchedulerSampling, SigmoidSchedulerSampling,
-    SchedulerSamplingLength
+    LinearSchedulerSampling, SigmoidSchedulerSampling
 )
 from utils.warmup import WarmupScheduler
 import numpy as np
@@ -89,11 +88,12 @@ def log_gradients(model: nn.Module, step_info: dict, writer: SummaryWriter):
     total_norm = total_norm ** 0.5
     writer.add_scalar("gradients/total_norm", total_norm, step_info["global_step"])
 
-def save_configs(args):
+def save_configs(args, curriculum_levels=None):
     os.makedirs("configs", exist_ok=True)
     model_name = args.name
 
     json_args = vars(args)
+    json_args['curriculum_levels'] = curriculum_levels
     with open(f'configs/{model_name}_config.json', 'w', encoding='utf-8') as f:
         f.write(json.dumps(json_args, indent=4, ensure_ascii=False))
 
@@ -103,9 +103,9 @@ def log_lr(optimizer: torch.optim.Optimizer, step_info: dict, writer: SummaryWri
 def log_teacher_forcing_ratio(scheduler_sampling: LinearSchedulerSampling, step_info: dict, writer: SummaryWriter):
     writer.add_scalar("teacher_forcing_ratio", scheduler_sampling.get_ratio(), step_info["global_step"])
 
-def log_max_len(scheduler_sampling_length: SchedulerSamplingLength, step_info: dict, writer: SummaryWriter):
-    if scheduler_sampling_length.use:
-        max_len = scheduler_sampling_length.get_max_len(step_info["global_step"])
+def log_max_len(sampler: CurriculumLengthSampler, step_info: dict, writer: SummaryWriter):
+    if sampler:
+        max_len = sampler.get_max_length()
         writer.add_scalar("max_len", max_len, step_info["global_step"])
 
 def train(
@@ -121,7 +121,7 @@ def train(
     scheduler: WarmupScheduler,
     tokenizer: Tokenizer = None,
     scheduler_sampling: LinearSchedulerSampling = None,
-    scheduler_sampling_length: SchedulerSamplingLength = None
+    sampler: CurriculumLengthSampler = None,
 ):
     stop = False
     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
@@ -159,6 +159,7 @@ def train(
                 optimizer.step()
                 scheduler.step()
                 scheduler_sampling.step()
+                sampler.step()
 
                 step_info["global_step"] += 1
                 
@@ -172,7 +173,7 @@ def train(
 
                     log_lr(optimizer, step_info, writer)
                     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
-                    log_max_len(scheduler_sampling_length, step_info, writer)
+                    log_max_len(sampler, step_info, writer)
 
                 optimizer.zero_grad()
 
@@ -254,7 +255,21 @@ if __name__ == "__main__":
         max_len=int(args.max_len*1.5)
     )
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    curriculum_levels = [
+        {"max_step": 25000, "max_len": 10},
+        {"max_step": 50000, "max_len": 15},
+        {"max_step": 100000, "max_len": 25},
+        {"max_step": 500000, "max_len": args.max_len},
+    ]
+
+    sampler = CurriculumLengthSampler(
+        tokens_src=df_train[f'en_tokens_{args.vocab_size}'].tolist(),
+        tokens_tgt=df_train[f'pt_tokens_{args.vocab_size}'].tolist(),
+        len_tokens=args.max_len,
+        curriculum_levels=curriculum_levels
+    )
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
 
     tokenizer = Tokenizer.from_file(f'artifacts/tokenizer_{args.vocab_size}.json')
 
@@ -293,17 +308,7 @@ if __name__ == "__main__":
         use=args.scheduler_sampling
     )
 
-    list_dicts_len = [
-        {"max_step": 25000, "max_len": 10},
-        {"max_step": 50000, "max_len": 20},
-        {"max_step": 100000, "max_len": 40},
-        {"max_step": 500000, "max_len": 54},
-    ]
 
-    scheduler_sampling_length = SchedulerSamplingLength(
-        list_dicts_len=list_dicts_len,
-        use=args.scheduler_sampling_length
-    )
 
     train_config = {
         "batch_size": args.batch_size,
@@ -329,7 +334,7 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir=f"runs/{args.name}")
     early_stopper = EarlyStopper(patience=args.early_stop_patience, min_delta=args.early_stop_min_delta)
 
-    save_configs(args)
+    save_configs(args, curriculum_levels=curriculum_levels)
 
     logger.info("Starting training loop...")
     train(
@@ -345,7 +350,7 @@ if __name__ == "__main__":
         scheduler, 
         tokenizer,
         scheduler_sampling,
-        scheduler_sampling_length
+        sampler
     )
 
 

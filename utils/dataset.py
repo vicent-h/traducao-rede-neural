@@ -37,12 +37,12 @@ class TranslateDataset(Dataset):
 
 
 class CurriculumLengthSampler(Sampler):
-    def __init__(self, tokens_src, tokens_tgt, len_tokens, list_dicts):
+    def __init__(self, tokens_src, tokens_tgt, len_tokens, curriculum_levels):
         self.tokens_src = tokens_src
         self.tokens_tgt = tokens_tgt
         self.len_tokens = len_tokens
-        self.max_length = list_dicts[0]["max_len"]  # Começa com o primeiro nível do currículo
-        self.curriculum_levels = list_dicts
+        self.max_length = curriculum_levels[0]["max_len"]  # Começa com o primeiro nível do currículo
+        self.curriculum_levels = curriculum_levels
         self.step_count = 0
         
         # Passo 1: Mapeamento inicial na inicialização
@@ -64,6 +64,8 @@ class CurriculumLengthSampler(Sampler):
                 print(f"Currículo atualizado: Agora treinando com sentenças de até {self.max_length} tokens.")
                 break
 
+    def get_max_length(self):
+        return self.max_length
 
     def __iter__(self):
         # Passo 2: O Fluxo de Filtragem Passiva

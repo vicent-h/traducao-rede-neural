@@ -1,0 +1,51 @@
+{
+    "invert_src": false,
+    "embedding_dim": 384,
+    "encoder_hidden_dim": 1024,
+    "decoder_hidden_dim": 1024,
+    "encoder_num_layers": 3,
+    "decoder_num_layers": 3,
+    "encoder_dropout": 0.4,
+    "decoder_dropout": 0.4,
+    "encoder_bidirectional": true,
+    "batch_size": 128,
+    "accum_steps": 1,
+    "log_steps": 250,
+    "save_steps": 1000,
+    "eval_steps": 500,
+    "device": "cuda",
+    "desc": "Adicionando curriculum learning por comprimento de frases",
+    "name": "v47",
+    "early_stop_patience": 10,
+    "early_stop_min_delta": 0.0,
+    "warmup_steps": 1000,
+    "max_steps": 500000,
+    "learning_rate": 0.0001,
+    "vocab_size": 50000,
+    "max_len": 54,
+    "clip_grad": null,
+    "init_weight_method": "xavier_uniform",
+    "init_bias_method": "zeros",
+    "teacher_forcing": true,
+    "scheduler_sampling": false,
+    "teacher_forcing_ratio": 1.0,
+    "max_steps_scheduler_sampling": 50000,
+    "curriculum_levels": [
+        {
+            "max_step": 25000,
+            "max_len": 10
+        },
+        {
+            "max_step": 50000,
+            "max_len": 20
+        },
+        {
+            "max_step": 100000,
+            "max_len": 40
+        },
+        {
+            "max_step": 500000,
+            "max_len": 54
+        }
+    ]
+}

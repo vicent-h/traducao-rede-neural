@@ -212,14 +212,47 @@ class LSTM(nn.Module):
         loss: torch.Tensor = criterion(output, tgt)
         return loss
     
-    def eval_step(self, src, tgt, criterion):
+    def eval_step(
+            self, 
+            src: torch.Tensor, 
+            tgt: torch.Tensor, 
+            criterion: nn.CrossEntropyLoss,
+            bos_token_id=5):
         self.eval()
         with torch.no_grad():
-            output = self(src, tgt[:, :-1])
-            output_dim = output.shape[-1]
-            output = output.view(-1, output_dim)
-            tgt = tgt[:, 1:].reshape(-1)
-            loss = criterion(output, tgt)
+            batch_size = src.size(0)
+            max_len = tgt.size(1)
+            device = src.device
+            h, c = self.encode(src)
+            current_token = torch.full(
+                (batch_size, 1),
+                bos_token_id,
+                dtype=torch.long,
+                device=device
+            )
+
+            outputs = []
+
+            for t in range(max_len - 1):
+                predictions, h, c = self.decode(
+                    current_token,
+                    h,
+                    c
+                )
+                outputs.append(predictions)
+
+                current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
+            output = torch.cat(outputs, dim=1)
+            
+
+        output_dim = output.shape[-1] # (vocab_size)
+        
+        output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
+
+        logger.debug(f'Output shape after reshape train step: {output.shape}')
+
+        tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
+        loss: torch.Tensor = criterion(output, tgt)
         return loss.item()
     
     def predict(

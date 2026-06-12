@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset, Sampler
 import random
 import torch
-
+from torch.utils.data import BatchSampler
 
 class TranslateDataset(Dataset):
     def __init__(self, tokens_src, tokens_tgt, invert_src=False, max_len=60):
@@ -44,6 +44,8 @@ class CurriculumLengthSampler(Sampler):
         self.max_length = curriculum_levels[0]["max_len"]  # Começa com o primeiro nível do currículo
         self.curriculum_levels = curriculum_levels
         self.step_count = 0
+        self.level_index = 0
+        self.level_actual = curriculum_levels[self.level_index]
         
         # Passo 1: Mapeamento inicial na inicialização
         # Varre o dataset e guarda o tamanho de cada sequência pelo seu índice
@@ -57,22 +59,26 @@ class CurriculumLengthSampler(Sampler):
 
     def step(self):
         self.step_count += 1
-        # Verifica se é hora de avançar para o próximo nível do currículo
-        for level in self.curriculum_levels:
-            if self.step_count >= level["max_step"]:
-                self.max_length = level["max_len"]
-                print(f"Currículo atualizado: Agora treinando com sentenças de até {self.max_length} tokens.")
-                break
+        level_actual = self.curriculum_levels[self.level_index]
+        if self.step_count > level_actual["max_step"] and self.level_index < len(self.curriculum_levels) - 1:
+            self.level_index += 1
+            self.level_actual = self.curriculum_levels[self.level_index]
 
     def get_max_length(self):
-        return self.max_length
+        return self.level_actual["max_len"]
+    
+    def get_batch_size(self):
+        return self.level_actual["batch_size"]
+    
+    def get_accum_steps(self):
+        return self.level_actual["accum_steps"]
 
     def __iter__(self):
         # Passo 2: O Fluxo de Filtragem Passiva
         # Filtra apenas os índices cujas sentenças respeitam o limite atual
         valid_indices = [
             idx for idx, length in self.indices_with_lengths 
-            if length <= self.max_length
+            if length <= self.get_max_length()
         ]
         
         # Garante o embaralhamento (shuffling) dentro do grupo de dados fáceis
@@ -84,6 +90,37 @@ class CurriculumLengthSampler(Sampler):
         # O tamanho do sampler muda dinamicamente conforme mais dados são liberados
         valid_indices = [
             idx for idx, length in self.indices_with_lengths 
-            if length <= self.max_length
+            if length <= self.get_max_length()
         ]
         return len(valid_indices)
+
+class DynamicBatchSampler(BatchSampler):
+    def __init__(self, sampler: CurriculumLengthSampler):
+        self.sampler = sampler
+        self.drop_last = False  # Adicionar esta linha
+        self.batch_size = self.sampler.get_batch_size()  # Inicializa com o batch size do primeiro nível do currículo
+
+    def step(self):
+        """Método para avançar o currículo e potencialmente alterar o tamanho do lote"""
+        self.sampler.step()
+        self.batch_size = self.sampler.get_batch_size()  # Atualiza o batch size conforme o currículo avança
+    
+    def get_max_length(self):
+        return self.sampler.get_max_length()
+    
+    def get_batch_size(self):
+        return self.sampler.get_batch_size()
+    
+    def get_accum_steps(self):
+        return self.sampler.get_accum_steps()
+
+    def __iter__(self):
+        batch = []
+        # Puxa os índices filtrados que vêm do seu CurriculumLengthSampler
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.get_batch_size():
+                yield batch
+                batch = []
+        if len(batch) > 0:
+            yield batch

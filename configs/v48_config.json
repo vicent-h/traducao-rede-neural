@@ -8,7 +8,7 @@
     "encoder_dropout": 0.4,
     "decoder_dropout": 0.4,
     "encoder_bidirectional": true,
-    "batch_size": 256,
+    "batch_size": 128,
     "accum_steps": 1,
     "log_steps": 250,
     "save_steps": 1000,
@@ -16,7 +16,7 @@
     "device": "cuda",
     "desc": "Adicionando curriculum learning por comprimento de frases",
     "name": "v48",
-    "early_stop_patience": 10,
+    "early_stop_patience": 100,
     "early_stop_min_delta": 0.0,
     "warmup_steps": 1000,
     "max_steps": 500000,
@@ -32,20 +32,22 @@
     "max_steps_scheduler_sampling": 50000,
     "curriculum_levels": [
         {
-            "max_step": 25000,
-            "max_len": 10
+            "max_step": 40000,
+            "max_len": 10,
+            "batch_size": 256,
+            "accum_steps": 1
         },
         {
-            "max_step": 50000,
-            "max_len": 15
-        },
-        {
-            "max_step": 100000,
-            "max_len": 25
+            "max_step": 10000,
+            "max_len": 20,
+            "batch_size": 128,
+            "accum_steps": 1
         },
         {
             "max_step": 500000,
-            "max_len": 30
+            "max_len": 30,
+            "batch_size": 128,
+            "accum_steps": 1
         }
     ]
 }

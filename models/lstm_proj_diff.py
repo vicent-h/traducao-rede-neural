@@ -245,15 +245,21 @@ class LSTM(nn.Module):
             output = torch.cat(outputs, dim=1)
             
 
-        output_dim = output.shape[-1] # (vocab_size)
-        
-        output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
+            output_dim = output.shape[-1] # (vocab_size)
+            
+            output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
 
-        logger.debug(f'Output shape after reshape train step: {output.shape}')
+            logger.debug(f'Output shape after reshape train step: {output.shape}')
 
-        tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
-        loss: torch.Tensor = criterion(output, tgt)
-        return loss.item()
+            tgt_flat = tgt[:, 1:].flatten() # [tgt_len * batch_size]
+            loss_no_tf: torch.Tensor = criterion(output, tgt_flat)
+
+            output = self(src, tgt[:, :-1])
+            output_dim = output.shape[-1]
+            output = output.view(-1, output_dim)
+            tgt = tgt[:, 1:].reshape(-1)
+            loss: torch.Tensor = criterion(output, tgt)
+        return loss.item(), loss_no_tf.item()
     
     def predict(
         self,

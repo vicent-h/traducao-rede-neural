@@ -5,7 +5,10 @@ from torch.utils.data import DataLoader
 import logging
 import os
 from models.lstm_proj_diff import LSTM
-from utils.dataset import TranslateDataset, CurriculumLengthSampler
+from utils.dataset import (
+    TranslateDataset, CurriculumLengthSampler,
+    DynamicBatchSampler
+)
 from utils.earlystopper import EarlyStopper
 import pandas as pd
 from logging import getLogger
@@ -35,9 +38,10 @@ def eval(model: LSTM, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, st
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
 
-            loss = model.eval_step(src, tgt, criterion)
+            loss, loss_no_tf = model.eval_step(src, tgt, criterion)
 
             step_info["loss_eval"] += loss
+            step_info["loss_no_tf_eval"] += loss_no_tf
 
             if not printed_example:
                 index_to_print = np.random.randint(0, src.size(0))
@@ -103,10 +107,15 @@ def log_lr(optimizer: torch.optim.Optimizer, step_info: dict, writer: SummaryWri
 def log_teacher_forcing_ratio(scheduler_sampling: LinearSchedulerSampling, step_info: dict, writer: SummaryWriter):
     writer.add_scalar("teacher_forcing_ratio", scheduler_sampling.get_ratio(), step_info["global_step"])
 
-def log_max_len(sampler: CurriculumLengthSampler, step_info: dict, writer: SummaryWriter):
-    if sampler:
+def log_max_len(sampler: DynamicBatchSampler, step_info: dict, writer: SummaryWriter):
+    if sampler is not None:
         max_len = sampler.get_max_length()
         writer.add_scalar("max_len", max_len, step_info["global_step"])
+
+def log_batch_size(sampler: DynamicBatchSampler, step_info: dict, writer: SummaryWriter):
+    if sampler is not None:
+        batch_size = sampler.get_batch_size()
+        writer.add_scalar("batch_size", batch_size, step_info["global_step"])
 
 def train(
     model: LSTM, 
@@ -121,7 +130,8 @@ def train(
     scheduler: WarmupScheduler,
     tokenizer: Tokenizer = None,
     scheduler_sampling: LinearSchedulerSampling = None,
-    sampler: CurriculumLengthSampler = None,
+    sampler: DynamicBatchSampler = None,
+    sampler_eval: DynamicBatchSampler = None
 ):
     stop = False
     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
@@ -147,7 +157,7 @@ def train(
                 criterion, 
                 train_config["teacher_forcing"], 
                 scheduler_sampling=scheduler_sampling)
-            loss = loss / train_config["accum_steps"]
+            loss = loss / sampler.get_accum_steps()
             loss.backward()
             step_info["loss_train"] += loss.item()
             step_info["loss_train_count"] += 1
@@ -155,11 +165,12 @@ def train(
 
             if train_config["clip_grad"] is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=train_config["clip_grad"])
-            if step_info["step"] % train_config['accum_steps'] == 0:
+            if step_info["step"] % sampler.get_accum_steps() == 0:
                 optimizer.step()
                 scheduler.step()
                 scheduler_sampling.step()
                 sampler.step()
+                sampler_eval.step()
 
                 step_info["global_step"] += 1
                 
@@ -174,6 +185,7 @@ def train(
                     log_lr(optimizer, step_info, writer)
                     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
                     log_max_len(sampler, step_info, writer)
+                    log_batch_size(sampler, step_info, writer)
 
                 optimizer.zero_grad()
 
@@ -184,14 +196,17 @@ def train(
                 if step_info["global_step"] % train_config["eval_steps"] == 0:
                     eval(model, dataloader_eval, criterion, step_info, writer, train_config, tokenizer)
                     eval_loss = step_info["loss_eval"] / len(dataloader_eval)
+                    eval_loss_no_tf = step_info["loss_no_tf_eval"] / len(dataloader_eval)
                     logger.debug(f'Step {step_info["global_step"]} - Eval Loss: {eval_loss:.4f}')
                     writer.add_scalar("Loss/Eval", eval_loss, step_info["global_step"])
+                    writer.add_scalar("Loss/Eval_no_teacher_forcing", eval_loss_no_tf, step_info["global_step"])
                     step_info["loss_eval"] = 0
+                    step_info["loss_no_tf_eval"] = 0
 
-                    # if eval_loss < step_info["best_eval_loss"]:
-                    step_info["best_eval_loss"] = eval_loss
-                    torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
-                    logger.debug(f'New best model saved at step {step_info["global_step"]} with eval loss {eval_loss:.4f}')
+                    if eval_loss < step_info["best_eval_loss"]:
+                        step_info["best_eval_loss"] = eval_loss
+                        torch.save(model.state_dict(), f'artifacts/model_{args.name}.pt')
+                        logger.debug(f'New best model saved at step {step_info["global_step"]} with eval loss {eval_loss:.4f}')
 
                     stop = early_stopper.step(eval_loss)
                     if stop:
@@ -224,7 +239,7 @@ if __name__ == "__main__":
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    args.add_argument("--early_stop_patience", type=int, default=10)
+    args.add_argument("--early_stop_patience", type=int, default=100)
     args.add_argument("--early_stop_min_delta", type=float, default=0.0)
     args.add_argument("--warmup_steps", type=int, default=5000)
     args.add_argument("--max_steps", type=int, default=500000)
@@ -241,11 +256,11 @@ if __name__ == "__main__":
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
-    df_train = pd.read_parquet("data/tokenized_train.parquet")#.sample(n=2, random_state=42).reset_index(drop=True)
+    df_train = pd.read_parquet("data/tokenized_train.parquet")#.sample(n=256, random_state=42).reset_index(drop=True)
     df_train = df_train.loc[df_train[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True)
     # df_train.to_parquet("data/tokenized_train_amostrado.parquet", index=False)
     df_eval = pd.read_parquet("data/tokenized_eval.parquet")
-    df_eval = df_eval.loc[df_eval[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True).sample(frac=0.1, random_state=42)
+    df_eval = df_eval.loc[df_eval[f'en_tokens_{args.vocab_size}_len'] <= args.max_len].reset_index(drop=True).sample(frac=0.15, random_state=42)
 
     logger.info("Creating dataset...")
     dataset = TranslateDataset(
@@ -256,10 +271,9 @@ if __name__ == "__main__":
     )
 
     curriculum_levels = [
-        {"max_step": 25000, "max_len": 10},
-        {"max_step": 50000, "max_len": 15},
-        {"max_step": 100000, "max_len": 25},
-        {"max_step": 500000, "max_len": args.max_len},
+        {"max_step": 40000, "max_len": 10, "batch_size": 256, "accum_steps": 1},
+        {"max_step": 10000, "max_len": 20, "batch_size": 128, "accum_steps": 1},
+        {"max_step": args.max_steps, "max_len": args.max_len, "batch_size": 128, "accum_steps": 1},
     ]
 
     sampler = CurriculumLengthSampler(
@@ -268,8 +282,8 @@ if __name__ == "__main__":
         len_tokens=args.max_len,
         curriculum_levels=curriculum_levels
     )
-
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler)
+    batch_sampler = DynamicBatchSampler(sampler)
+    dataloader = DataLoader(dataset, batch_sampler=batch_sampler)
 
     tokenizer = Tokenizer.from_file(f'artifacts/tokenizer_{args.vocab_size}.json')
 
@@ -280,7 +294,14 @@ if __name__ == "__main__":
         max_len=int(args.max_len*1.5)
     )
 
-    dataloader_eval = DataLoader(dataset_eval, batch_size=args.batch_size, shuffle=False)
+    sampler_eval = CurriculumLengthSampler(
+        tokens_src=df_eval[f'en_tokens_{args.vocab_size}'].tolist(),
+        tokens_tgt=df_eval[f'pt_tokens_{args.vocab_size}'].tolist(),
+        len_tokens=args.max_len,
+        curriculum_levels=curriculum_levels
+    )
+    batch_sampler_eval = DynamicBatchSampler(sampler_eval)
+    dataloader_eval = DataLoader(dataset_eval, batch_sampler=batch_sampler_eval)
 
     logger.info("Creating model...")
     model = LSTM(
@@ -308,8 +329,6 @@ if __name__ == "__main__":
         use=args.scheduler_sampling
     )
 
-
-
     train_config = {
         "batch_size": args.batch_size,
         "accum_steps": args.accum_steps,
@@ -326,6 +345,7 @@ if __name__ == "__main__":
         "loss_train": 0,
         "loss_train_count": 0,
         "loss_eval": 0,
+        "loss_no_tf_eval": 0,
         "step": 0,
         'best_eval_loss': float('inf'),
         'global_step': 0
@@ -350,7 +370,8 @@ if __name__ == "__main__":
         scheduler, 
         tokenizer,
         scheduler_sampling,
-        sampler
+        batch_sampler,
+        batch_sampler_eval
     )
 
 

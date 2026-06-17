@@ -7,7 +7,7 @@ from utils.scheduler_sampling import LinearSchedulerSampling
 
 
 logger = getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 # handler = logging.StreamHandler()
 # handler.setLevel(logging.DEBUG)
@@ -170,7 +170,7 @@ class LSTM(nn.Module):
         ) -> torch.Tensor:
         self.train()
 
-        if teacher_forcing and scheduler_sampling.get_ratio() >= 0.99:
+        if teacher_forcing and scheduler_sampling.get_ratio() >= 1:
             output = self(src, tgt[:, :-1]) # torch.Size([64, 44, 10000])
         else:
             batch_size = src.size(0)

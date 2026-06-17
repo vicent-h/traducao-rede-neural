@@ -24,16 +24,11 @@ class TranslateDataset(Dataset):
 
         src = src[1:]  # Remove <BOS>
 
+        # Trunca para um comprimento máximo, mas NÃO aplica padding aqui.
         src = list(src[:self.max_len])
         tgt = list(tgt[:self.max_len])
 
-
-        if len(src) < self.max_len:
-            src += [0] * (self.max_len - len(src))
-        if len(tgt) < self.max_len:
-            tgt += [0] * (self.max_len - len(tgt))
-
-        return torch.tensor(src), torch.tensor(tgt)
+        return torch.tensor(src, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
 
 class CurriculumLengthSampler(Sampler):
@@ -52,9 +47,9 @@ class CurriculumLengthSampler(Sampler):
         self.indices_with_lengths = []
         for idx in range(len(self.tokens_src)):
             # Assumindo que o seu dataset retorna (input_tensor, target_tensor)
-            # e que o input_tensor tem a propriedade de tamanho/shape
+            # O dataset remove o <BOS> em __getitem__, então considera-se len-1
             input_tensor = self.tokens_src[idx]
-            length = len(input_tensor)
+            length = max(0, len(input_tensor) - 1)
             self.indices_with_lengths.append((idx, length))
 
     def step(self):
@@ -124,3 +119,36 @@ class DynamicBatchSampler(BatchSampler):
                 batch = []
         if len(batch) > 0:
             yield batch
+
+
+class DynamicCollator:
+    """Collator que aplica padding dinâmico por batch usando o max_len atual do sampler/batch_sampler."""
+    def __init__(self, batch_sampler, pad_value: int = 0):
+        # batch_sampler pode ser uma instância de DynamicBatchSampler
+        self.batch_sampler = batch_sampler
+        self.pad_value = pad_value
+
+    def __call__(self, batch):
+        # batch: list de (src_tensor, tgt_tensor) com comprimentos variáveis
+        max_len = self.batch_sampler.get_max_length()
+
+        srcs = []
+        tgts = []
+        for src, tgt in batch:
+            # converter para lista Python para facilitar trunc/pad
+            src_list = src.tolist() if isinstance(src, torch.Tensor) else list(src)
+            tgt_list = tgt.tolist() if isinstance(tgt, torch.Tensor) else list(tgt)
+
+            # Trunca (por segurança) e então aplica padding para max_len
+            src_list = src_list[:max_len]
+            tgt_list = tgt_list[:max_len]
+
+            if len(src_list) < max_len:
+                src_list += [self.pad_value] * (max_len - len(src_list))
+            if len(tgt_list) < max_len:
+                tgt_list += [self.pad_value] * (max_len - len(tgt_list))
+
+            srcs.append(torch.tensor(src_list, dtype=torch.long))
+            tgts.append(torch.tensor(tgt_list, dtype=torch.long))
+
+        return torch.stack(srcs), torch.stack(tgts)

@@ -14,8 +14,8 @@
     "save_steps": 1000,
     "eval_steps": 500,
     "device": "cuda",
-    "desc": "Treinando com frases mais longas sem curriculum learning",
-    "name": "v47",
+    "desc": "Antecipando o curriculo para 40k",
+    "name": "v49",
     "early_stop_patience": 100,
     "early_stop_min_delta": 0.0,
     "warmup_steps": 1000,
@@ -27,10 +27,16 @@
     "init_weight_method": "xavier_uniform",
     "init_bias_method": "zeros",
     "teacher_forcing": true,
-    "scheduler_sampling": false,
+    "scheduler_sampling": true,
     "teacher_forcing_ratio": 1.0,
-    "max_steps_scheduler_sampling": 50000,
+    "max_steps_scheduler_sampling": 40000,
     "curriculum_levels": [
+        {
+            "max_step": 80000,
+            "max_len": 10,
+            "batch_size": 1024,
+            "accum_steps": 1
+        },
         {
             "max_step": 500000,
             "max_len": 30,

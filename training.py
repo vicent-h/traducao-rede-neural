@@ -7,7 +7,7 @@ import os
 from models.lstm_proj_diff import LSTM
 from utils.dataset import (
     TranslateDataset, CurriculumLengthSampler,
-    DynamicBatchSampler
+    DynamicBatchSampler, DynamicCollator
 )
 from utils.earlystopper import EarlyStopper
 import pandas as pd
@@ -24,7 +24,7 @@ from utils.warmup import WarmupScheduler
 import numpy as np
 
 logger = getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 # handler = logging.StreamHandler()
 # handler.setLevel(logging.DEBUG)
@@ -46,24 +46,28 @@ def eval(model: LSTM, dataloader: DataLoader, criterion: nn.CrossEntropyLoss, st
             if not printed_example:
                 index_to_print = np.random.randint(0, src.size(0))
                 # obtain model predictions (teacher-forced) and show first sample
-                preds_logits = model(src, tgt[:, :-1])
+                preds_logits: torch.Tensor = model(src[index_to_print:index_to_print+1], tgt[index_to_print:index_to_print+1, :-1])
                 preds_ids = preds_logits.argmax(dim=-1)  # [batch, tgt_len]
 
-                ref_ids = tgt[:, 1:]
+                preds_ids_no_tf = model.predict(src[index_to_print:index_to_print+1], 5, 6, max_len=tgt.size(1))
+
+                ref_ids: torch.Tensor = tgt[index_to_print, 1:]
 
                 # log token ids
                 print(f'Example tgt ids passed to model: {tgt[index_to_print, :-1]}')
-                print(f"Example ref ids: {ref_ids[index_to_print]}")
-                print(f"Example pred ids: {preds_ids[index_to_print]}")
-                
+                print(f"Example ref ids: {ref_ids}")
+                print(f"Example pred ids: {preds_ids.squeeze()}")
+                print(f"Example pred ids (no TF): {preds_ids_no_tf.squeeze()}")
 
                 if tokenizer is not None:
                     try:
-                        ref_np = ref_ids[index_to_print].cpu().numpy()
-                        pred_np = preds_ids[index_to_print].cpu().numpy()
+                        ref_np = ref_ids.squeeze().cpu().numpy()
+                        pred_np = preds_ids.squeeze().cpu().numpy()
+                        preds_no_tf_np = preds_ids_no_tf.squeeze().cpu().numpy()
                         print('Src decoded:', tokenizer.decode(src[index_to_print].cpu().numpy(), skip_special_tokens=False))
                         print(f"Example ref decoded: {tokenizer.decode(ref_np, skip_special_tokens=False)}")
                         print(f"Example pred decoded: {tokenizer.decode(pred_np, skip_special_tokens=False)}")
+                        print(f"Example pred decoded (no TF): {tokenizer.decode(preds_no_tf_np, skip_special_tokens=False)}")
                     except Exception:
                         logger.exception("Failed to decode tokens with tokenizer")
 
@@ -271,10 +275,10 @@ if __name__ == "__main__":
     )
 
     curriculum_levels = [
-        {"max_step": 40000, "max_len": 10, "batch_size": 256, "accum_steps": 1},
-        {"max_step": 10000, "max_len": 20, "batch_size": 128, "accum_steps": 1},
-        {"max_step": args.max_steps, "max_len": args.max_len, "batch_size": 128, "accum_steps": 1},
+        {"max_step": 125000, "max_len": 10, "batch_size": 1024, "accum_steps": 1},
+        {"max_step": args.max_steps, "max_len": args.max_len, "batch_size": args.batch_size, "accum_steps": args.accum_steps},
     ]
+
 
     sampler = CurriculumLengthSampler(
         tokens_src=df_train[f'en_tokens_{args.vocab_size}'].tolist(),
@@ -283,7 +287,8 @@ if __name__ == "__main__":
         curriculum_levels=curriculum_levels
     )
     batch_sampler = DynamicBatchSampler(sampler)
-    dataloader = DataLoader(dataset, batch_sampler=batch_sampler)
+    collator = DynamicCollator(batch_sampler)
+    dataloader = DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=collator)
 
     tokenizer = Tokenizer.from_file(f'artifacts/tokenizer_{args.vocab_size}.json')
 
@@ -301,7 +306,8 @@ if __name__ == "__main__":
         curriculum_levels=curriculum_levels
     )
     batch_sampler_eval = DynamicBatchSampler(sampler_eval)
-    dataloader_eval = DataLoader(dataset_eval, batch_sampler=batch_sampler_eval)
+    collator_eval = DynamicCollator(batch_sampler_eval)
+    dataloader_eval = DataLoader(dataset_eval, batch_sampler=batch_sampler_eval, collate_fn=collator_eval)
 
     logger.info("Creating model...")
     model = LSTM(

@@ -14,7 +14,8 @@ class LinearSchedulerSampling:
     def should_sample(self) -> bool:
         if not self.use:
             return True
-        return torch.rand(1).item() <= self.teacher_forcing_ratio
+        ratio = round(self.teacher_forcing_ratio, 2)
+        return torch.rand(1).item() <= ratio
     
     def step(self):
         if self.use:
@@ -23,13 +24,13 @@ class LinearSchedulerSampling:
         self.step_count += 1
 
     def get_ratio(self) -> float:
-        return self.teacher_forcing_ratio
+        return round(self.teacher_forcing_ratio, 2)
     
 
 class SigmoidSchedulerSampling:
     def __init__(self, teacher_forcing_ratio: float = 1.0, max_steps: int = 10000, sigma: int = 10000, use: bool = False):
-        self.initial_teacher_forcing_ratio = teacher_forcing_ratio
-        self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.initial_teacher_forcing_ratio = round(teacher_forcing_ratio, 2)
+        self.teacher_forcing_ratio = round(teacher_forcing_ratio, 2)
         self.center = max_steps / 2
         self.max_steps = max_steps
         self.sigma = sigma
@@ -39,13 +40,14 @@ class SigmoidSchedulerSampling:
     def should_sample(self) -> bool:
         if not self.use:
             return True
-        use = torch.rand(1).item() <= self.teacher_forcing_ratio
-        # print(f"Step: {self.step_count}, Teacher Forcing Ratio: {self.teacher_forcing_ratio:.4f}, Use Teacher Forcing: {use}")
-        return use
+        rand_val = round(torch.rand(1).item(), 2)
+        ratio = self.teacher_forcing_ratio
+        # print(f"Step: {self.step_count}, Teacher Forcing Ratio: {self.teacher_forcing_ratio:.4f}, Use Teacher Forcing: {rand_val <= ratio}")
+        return rand_val <= ratio
     
     def step(self):
         if self.use:
-            self.teacher_forcing_ratio = 1.0 / (1.0 + math.exp((self.step_count - self.center) / self.sigma))
+            self.teacher_forcing_ratio = round(1.0 / (1.0 + math.exp((self.step_count - self.center) / self.sigma)), 2)
         self.step_count += 1
 
     def get_ratio(self) -> float:

@@ -28,7 +28,7 @@ class LinearSchedulerSampling:
     
 
 class SigmoidSchedulerSampling:
-    def __init__(self, teacher_forcing_ratio: float = 1.0, max_steps: int = 10000, sigma: int = 10000, use: bool = False):
+    def __init__(self, teacher_forcing_ratio: float = 1.0, max_steps: int = 10000, sigma: int = 5000, use: bool = False):
         self.initial_teacher_forcing_ratio = round(teacher_forcing_ratio, 2)
         self.teacher_forcing_ratio = round(teacher_forcing_ratio, 2)
         self.center = max_steps / 2

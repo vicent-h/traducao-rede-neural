@@ -14,7 +14,7 @@
     "save_steps": 1000,
     "eval_steps": 500,
     "device": "cuda",
-    "desc": "Atrasando curriculo para 120 mil e removendo clip de gradiente",
+    "desc": "Atrasando curriculo para 120 mil e removendo clip de gradiente e deixando o sigma do dynamic teacher forcing em 5k",
     "name": "v53",
     "early_stop_patience": 100,
     "early_stop_min_delta": 0.0,
@@ -29,10 +29,10 @@
     "teacher_forcing": true,
     "scheduler_sampling": true,
     "teacher_forcing_ratio": 1.0,
-    "max_steps_scheduler_sampling": 500000,
+    "max_steps_scheduler_sampling": 300000,
     "curriculum_levels": [
         {
-            "max_step": 125000,
+            "max_step": 100000,
             "max_len": 10,
             "batch_size": 1024,
             "accum_steps": 1

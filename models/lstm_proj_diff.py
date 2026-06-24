@@ -158,6 +158,32 @@ class LSTM(nn.Module):
         logger.debug('===== FORWARD END =====')
 
         return predictions
+
+    def _select_next_token(self, predictions: torch.Tensor, prev_token: torch.Tensor) -> torch.Tensor:
+        """
+        Select next token avoiding repeating the previous token.
+
+        If the top-1 (argmax) equals the previous token, return the top-2 token.
+        predictions: [batch_size, seq_len, vocab_size] or [batch_size, vocab_size]
+        prev_token: [batch_size, 1] or [batch_size]
+        Returns: [batch_size]
+        """
+        # get logits for last time step if needed
+        if predictions.dim() == 3:
+            logits = predictions[:, -1]
+        else:
+            logits = predictions
+
+        k = min(2, logits.size(-1))
+        topk = logits.topk(k, dim=-1).indices  # [batch, k]
+        top1 = topk[:, 0]
+        top2 = topk[:, 1] if k > 1 else top1
+
+        # normalize prev_token shape to [batch]
+        prev = prev_token.squeeze(-1) if prev_token.dim() > 1 else prev_token
+
+        selected = torch.where(top1 == prev, top2, top1)
+        return selected
     
     def train_step(
             self, 
@@ -198,7 +224,8 @@ class LSTM(nn.Module):
                 if teacher_forcing and scheduler_sampling.should_sample():
                     current_token = truth_token
                 else:
-                    current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
+                    next_sel = self._select_next_token(predictions, current_token)
+                    current_token = next_sel.unsqueeze(1)
             output = torch.cat(outputs, dim=1)
             
 
@@ -241,7 +268,8 @@ class LSTM(nn.Module):
                 )
                 outputs.append(predictions)
 
-                current_token = predictions[:, -1].argmax(dim=-1).unsqueeze(1)
+                next_sel = self._select_next_token(predictions, current_token)
+                current_token = next_sel.unsqueeze(1)
             output = torch.cat(outputs, dim=1)
             
 
@@ -314,7 +342,7 @@ class LSTM(nn.Module):
                 # h -> [num_layers, batch_size, hidden_size]
                 # c -> [num_layers, batch_size, hidden_size]
 
-                next_token = predictions[:, -1].argmax(dim=-1)
+                next_token = self._select_next_token(predictions, current_token)
 
                 # predictions[:, -1] -> [batch_size, vocab_size]
                 # next_token -> [batch_size]

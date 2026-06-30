@@ -41,13 +41,25 @@ class LSTM(nn.Module):
             batch_first=False
         )
 
-        self.decoder = nn.LSTM(
-            embedding_dim,
-            decoder_hidden_dim,
-            num_layers=decoder_num_layers,
-            dropout=decoder_dropout,
-            batch_first=False
-        )
+        if attention:
+            self.decoder = nn.LSTM(
+                embedding_dim + decoder_hidden_dim,
+                decoder_hidden_dim,
+                num_layers=decoder_num_layers,
+                dropout=decoder_dropout,
+                batch_first=False
+            )
+            self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
+
+        else:
+            self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
+            self.decoder = nn.LSTM(
+                embedding_dim,
+                decoder_hidden_dim,
+                num_layers=decoder_num_layers,
+                dropout=decoder_dropout,
+                batch_first=False
+            )
 
         num_directions = 2 if encoder_bidirectional else 1
 
@@ -59,17 +71,6 @@ class LSTM(nn.Module):
             encoder_hidden_dim * num_directions, decoder_hidden_dim
         )
 
-        if attention:
-            self.decoder = nn.LSTM(
-                embedding_dim + decoder_hidden_dim,
-                decoder_hidden_dim,
-                num_layers=decoder_num_layers,
-                dropout=decoder_dropout,
-                batch_first=False
-            )
-            self.fc_out = nn.Linear(2*decoder_hidden_dim, vocab_size)
-
-        
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
 
@@ -130,13 +131,18 @@ class LSTM(nn.Module):
         # [batch_size, tgt_len]
 
         logger.debug(f'Input decoder hidden shape: {h.shape}')
+        # [num_layers, batch_size, decoder_hidden_dim]
+
         logger.debug(f'Input decoder cell shape: {c.shape}')
+        # [num_layers, batch_size, decoder_hidden_dim]
 
         embedded_tgt = self.embedding(tgt)
-        
+        # [batch_size, tgt_len, embedding_dim]
 
         if not self.attention:
             embedded_tgt = embedded_tgt.permute(1, 0, 2)
+            # [tgt_len, batch_size, embedding_dim]
+
             logger.debug(f'Embedded tgt shape: {embedded_tgt.shape}')
             # [tgt_len, batch_size, embedding_dim]
 
@@ -144,30 +150,30 @@ class LSTM(nn.Module):
                 embedded_tgt,
                 (h, c)
             )
+            # outputs: [tgt_len, batch_size, decoder_hidden_dim]
+            # h: [num_layers, batch_size, decoder_hidden_dim]
+            # c: [num_layers, batch_size, decoder_hidden_dim]
 
             outputs = outputs.permute(1, 0, 2)
-
-            logger.debug(f'Decoder outputs shape: {outputs.shape}')
             # [batch_size, tgt_len, decoder_hidden_dim]
 
-            logger.debug(f'Decoder hidden state shape: {h.shape}')
-            logger.debug(f'Decoder cell state shape: {c.shape}')
-
             predictions = self.fc_out(outputs)
-
-            logger.debug(f'Predictions shape: {predictions.shape}')
             # [batch_size, tgt_len, vocab_size]
 
             return predictions, h, c
         
         encoded = None # history of decoder outputs for attention
+        # [batch_size, seq_len, decoder_hidden_dim] or None
         logits_total = []
+        # list of [batch_size, 1, vocab_size]
 
-        for i in range(embedded_tgt.size(0)):
+        for i in range(embedded_tgt.size(1)):
             
             current_input = embedded_tgt[:, i:i+1, :] # [B, 1, E]
+            # [batch_size, 1, embedding_dim]
 
             current_h = h[-1].unsqueeze(0) # [1, B, H]
+            # [1, batch_size, decoder_hidden_dim]
 
             if encoded is None:
 
@@ -176,36 +182,52 @@ class LSTM(nn.Module):
                     device=current_input.device,
                     dtype=current_input.dtype
                 ) # [B, 1, H]
+                # [batch_size, 1, decoder_hidden_dim]
             else:
-                score = torch.bmm([encoded, current_h]) # [B, 1, T]
-                attn_weights = torch.softmax(score, dim=1) # [B, 1, T]
+                # encoded: [B, T, H]
+                # current_h: [1, B, H]
+                score = torch.bmm(
+                    current_h.transpose(0, 1), # [batch_size, 1, decoder_hidden_dim]
+                    encoded.transpose(1, 2) # [batch_size, decoder_hidden_dim, seq_len]
+                ) # [B, 1, T]
+                # [batch_size, 1, seq_len]
+
+                attn_weights = torch.softmax(score, dim=-1) # [B, 1, T]
+                # [batch_size, 1, seq_len]
 
                 context = torch.bmm(
-                    attn_weights.transpose(1, 2), 
-                    encoded
-                ) # [B, T, 1] x [B, 1, H] -> [B, 1, H]
+                    attn_weights, # [batch_size, 1, seq_len]
+                    encoded # [batch_size, seq_len, decoder_hidden_dim]
+                ) # [B, 1, T] x [B, T, H] -> [B, 1, H]
 
             decoder_input = torch.cat([current_input, context], dim=-1) # [B, 1, E+H]
+            # [batch_size, 1, embedding_dim + decoder_hidden_dim]
 
             outputs, (h, c) = self.decoder(
                 decoder_input.permute(1, 0, 2), # [1, B, E+H]
                 (h, c)
             )
+            # outputs: [1, batch_size, decoder_hidden_dim]
+            # h: [num_layers, batch_size, decoder_hidden_dim]
+            # c: [num_layers, batch_size, decoder_hidden_dim]
 
             outputs = outputs.permute(1, 0, 2) # [B, 1, H]
 
             logits = self.fc_out(outputs) # [B, 1, V]
 
-            logits_total.append(logits)
+            logits_total.append(logits) # [batch_size, 1, vocab_size]
 
             if encoded is None:
-                encoded = outputs
+                encoded = outputs # [batch_size, 1, decoder_hidden_dim]
             else:
                 encoded = torch.cat([encoded, outputs], dim=1) # [B, T, H]
+                # [batch_size, seq_len, decoder_hidden_dim]
 
-            logits_total = torch.cat(logits_total, dim=1) # [B, T, V]
+        logits_total = torch.cat(logits_total, dim=1) # [B, T, V]
+        # [batch_size, tgt_len, vocab_size]
 
-            return logits_total, h, c
+        return logits_total, h, c
+        # [batch_size, tgt_len, vocab_size], [num_layers, batch_size, decoder_hidden_dim], [num_layers, batch_size, decoder_hidden_dim]
 
 
     def forward(self, src, tgt):

@@ -321,7 +321,8 @@ if __name__ == "__main__":
         decoder_dropout=args.decoder_dropout,
         encoder_bidirectional=args.encoder_bidirectional,
         vocab_size=args.vocab_size,
-        pad_idx=0
+        pad_idx=0,
+        attention=args.attention
     )
     model = model.to(args.device)
 

@@ -257,6 +257,7 @@ if __name__ == "__main__":
     args.add_argument("--scheduler_sampling", default=False, action="store_true")
     args.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
     args.add_argument("--max_steps_scheduler_sampling", type=int, default=50000)
+    args.add_argument("--attention", default=False, action="store_true")
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')

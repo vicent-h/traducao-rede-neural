@@ -1,0 +1,42 @@
+{
+    "invert_src": false,
+    "embedding_dim": 384,
+    "encoder_hidden_dim": 512,
+    "decoder_hidden_dim": 512,
+    "encoder_num_layers": 1,
+    "decoder_num_layers": 1,
+    "encoder_dropout": 0.1,
+    "decoder_dropout": 0.1,
+    "encoder_bidirectional": true,
+    "batch_size": 256,
+    "accum_steps": 1,
+    "log_steps": 250,
+    "save_steps": 1000,
+    "eval_steps": 500,
+    "device": "cuda",
+    "desc": "Implementando a atenção",
+    "name": "v55",
+    "early_stop_patience": 100,
+    "early_stop_min_delta": 0.0,
+    "warmup_steps": 1000,
+    "max_steps": 500000,
+    "learning_rate": 0.0001,
+    "vocab_size": 50000,
+    "max_len": 30,
+    "clip_grad": null,
+    "init_weight_method": "xavier_uniform",
+    "init_bias_method": "zeros",
+    "teacher_forcing": true,
+    "scheduler_sampling": false,
+    "teacher_forcing_ratio": 1.0,
+    "max_steps_scheduler_sampling": 50000,
+    "attention": true,
+    "curriculum_levels": [
+        {
+            "max_step": 500000,
+            "max_len": 30,
+            "batch_size": 256,
+            "accum_steps": 1
+        }
+    ]
+}

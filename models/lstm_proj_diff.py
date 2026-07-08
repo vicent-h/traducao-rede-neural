@@ -32,6 +32,8 @@ class LSTM(nn.Module):
         super(LSTM, self).__init__()
         self.attention = attention
 
+        num_directions = 2 if encoder_bidirectional else 1
+
         self.encoder = nn.LSTM(
             embedding_dim,
             encoder_hidden_dim,
@@ -51,6 +53,10 @@ class LSTM(nn.Module):
             )
             self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
 
+            self.proj_encoder_output = nn.Linear(
+                encoder_hidden_dim * num_directions, decoder_hidden_dim
+            )
+
         else:
             self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
             self.decoder = nn.LSTM(
@@ -61,7 +67,7 @@ class LSTM(nn.Module):
                 batch_first=False
             )
 
-        num_directions = 2 if encoder_bidirectional else 1
+        
 
         self.proj_hidden_h = nn.Linear(
             encoder_hidden_dim * num_directions, decoder_hidden_dim
@@ -70,6 +76,8 @@ class LSTM(nn.Module):
         self.proj_hidden_c = nn.Linear(
             encoder_hidden_dim * num_directions, decoder_hidden_dim
         )
+
+
 
 
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
@@ -84,7 +92,7 @@ class LSTM(nn.Module):
         logger.debug(f'Embedded src shape: {embedded_src.shape}')
         # [src_len, batch_size, embedding_dim]
 
-        _, (h, c) = self.encoder(embedded_src)
+        encoder_outputs, (h, c) = self.encoder(embedded_src)
 
         logger.debug(f'Encoder hidden state shape: {h.shape}')
         logger.debug(f'Encoder cell state shape: {c.shape}')
@@ -118,14 +126,18 @@ class LSTM(nn.Module):
             h = h0
             c = c0
 
+        if self.attention:
+            encoder_outputs = self.proj_encoder_output(encoder_outputs)
+            # [src_len, batch_size, decoder_hidden_dim]
+
         logger.debug(f'Decoder initial hidden shape: {h.shape}')
         logger.debug(f'Decoder initial cell shape: {c.shape}')
         # [decoder_num_layers, batch_size, decoder_hidden_dim]
 
-        return h, c
+        return encoder_outputs, h, c
 
 
-    def decode(self, tgt, h, c):
+    def decode(self, tgt, h, c, encoder_outputs=None):
 
         logger.debug(f'Tgt shape: {tgt.shape}')
         # [batch_size, tgt_len]
@@ -162,8 +174,9 @@ class LSTM(nn.Module):
 
             return predictions, h, c
         
-        encoded = None # history of decoder outputs for attention
-        # [batch_size, seq_len, decoder_hidden_dim] or None
+        encoder_outputs # [src_len, batch_size, decoder_hidden_dim]
+        encoder_outputs = encoder_outputs.permute(1, 0, 2) # [batch_size, src_len, decoder_hidden_dim]
+        
         logits_total = []
         # list of [batch_size, 1, vocab_size]
 
@@ -173,32 +186,20 @@ class LSTM(nn.Module):
             # [batch_size, 1, embedding_dim]
 
             current_h = h[-1].unsqueeze(0) # [1, B, H]
-            # [1, batch_size, decoder_hidden_dim]
+            # [1, batch_size, decoder_hidden_dim]     
 
-            if encoded is None:
+            score = torch.bmm(
+                current_h.transpose(0,1),       # [B,1,H]
+                encoder_outputs.transpose(1,2)  # [B,H,T]
+            )
 
-                context = torch.zeros(
-                    current_input.size(0), 1, self.decoder.hidden_size, 
-                    device=current_input.device,
-                    dtype=current_input.dtype
-                ) # [B, 1, H]
-                # [batch_size, 1, decoder_hidden_dim]
-            else:
-                # encoded: [B, T, H]
-                # current_h: [1, B, H]
-                score = torch.bmm(
-                    current_h.transpose(0, 1), # [batch_size, 1, decoder_hidden_dim]
-                    encoded.transpose(1, 2) # [batch_size, decoder_hidden_dim, seq_len]
-                ) # [B, 1, T]
-                # [batch_size, 1, seq_len]
+            attn_weights = torch.softmax(score, dim=-1) # [B, 1, T]
+            # [batch_size, 1, seq_len]
 
-                attn_weights = torch.softmax(score, dim=-1) # [B, 1, T]
-                # [batch_size, 1, seq_len]
-
-                context = torch.bmm(
-                    attn_weights, # [batch_size, 1, seq_len]
-                    encoded # [batch_size, seq_len, decoder_hidden_dim]
-                ) # [B, 1, T] x [B, T, H] -> [B, 1, H]
+            context = torch.bmm(
+                attn_weights, # [batch_size, 1, seq_len]
+                encoder_outputs # [batch_size, seq_len, decoder_hidden_dim]
+            ) # [B, 1, T] x [B, T, H] -> [B, 1, H]
 
             decoder_input = torch.cat([current_input, context], dim=-1) # [B, 1, E+H]
             # [batch_size, 1, embedding_dim + decoder_hidden_dim]
@@ -217,11 +218,6 @@ class LSTM(nn.Module):
 
             logits_total.append(logits) # [batch_size, 1, vocab_size]
 
-            if encoded is None:
-                encoded = outputs # [batch_size, 1, decoder_hidden_dim]
-            else:
-                encoded = torch.cat([encoded, outputs], dim=1) # [B, T, H]
-                # [batch_size, seq_len, decoder_hidden_dim]
 
         logits_total = torch.cat(logits_total, dim=1) # [B, T, V]
         # [batch_size, tgt_len, vocab_size]
@@ -234,9 +230,9 @@ class LSTM(nn.Module):
 
         logger.debug('===== FORWARD START =====')
 
-        h, c = self.encode(src)
+        encoder_outputs, h, c = self.encode(src)
 
-        predictions, _, _ = self.decode(tgt, h, c)
+        predictions, _, _ = self.decode(tgt, h, c, encoder_outputs)
 
         logger.debug('===== FORWARD END =====')
 
@@ -333,7 +329,7 @@ class LSTM(nn.Module):
             batch_size = src.size(0)
             max_len = tgt.size(1)
             device = src.device
-            h, c = self.encode(src)
+            encoder_outputs, h, c = self.encode(src)
             current_token = torch.full(
                 (batch_size, 1),
                 bos_token_id,
@@ -347,7 +343,8 @@ class LSTM(nn.Module):
                 predictions, h, c = self.decode(
                     current_token,
                     h,
-                    c
+                    c,
+                    encoder_outputs
                 )
                 outputs.append(predictions)
 
@@ -389,7 +386,7 @@ class LSTM(nn.Module):
 
         with torch.no_grad():
 
-            h, c = self.encode(src)
+            encoder_outputs, h, c = self.encode(src)
 
             # h -> [num_layers, batch_size, hidden_size]
             # c -> [num_layers, batch_size, hidden_size]
@@ -418,7 +415,8 @@ class LSTM(nn.Module):
                 predictions, h, c = self.decode(
                     current_token,
                     h,
-                    c
+                    c,
+                    encoder_outputs
                 )
 
                 # predictions -> [batch_size, 1, vocab_size]

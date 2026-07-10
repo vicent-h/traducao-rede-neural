@@ -23,7 +23,7 @@
     "learning_rate": 0.0001,
     "vocab_size": 50000,
     "max_len": 30,
-    "clip_grad": null,
+    "clip_grad": 1.5,
     "init_weight_method": "xavier_uniform",
     "init_bias_method": "zeros",
     "teacher_forcing": true,

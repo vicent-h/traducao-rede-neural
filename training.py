@@ -276,7 +276,7 @@ if __name__ == "__main__":
     )
 
     curriculum_levels = [
-        # {"max_step": 100000, "max_len": 10, "batch_size": 1024, "accum_steps": 1},
+        {"max_step": 100000, "max_len": 10, "batch_size": 1024, "accum_steps": 1},
         {"max_step": args.max_steps, "max_len": args.max_len, "batch_size": args.batch_size, "accum_steps": args.accum_steps},
     ]
 

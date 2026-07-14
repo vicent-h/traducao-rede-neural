@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 import logging
 import os
 from models.lstm_proj_diff import LSTM
+from models.transformer import Transformer
 from utils.dataset import (
     TranslateDataset, CurriculumLengthSampler,
     DynamicBatchSampler, DynamicCollator
@@ -24,7 +25,7 @@ from utils.warmup import WarmupScheduler
 import numpy as np
 
 logger = getLogger(__name__)
-logger.setLevel(logging.WARNING)
+# logger.setLevel(logging.DEBUG)
 
 # handler = logging.StreamHandler()
 # handler.setLevel(logging.DEBUG)
@@ -227,11 +228,14 @@ def train(
 if __name__ == "__main__":
     args = ArgumentParser()
     args.add_argument("--invert_src", default=False, action="store_true")
+    args.add_argument("--architecture", type=str, default="lstm", choices=["lstm", "transformer"])
     args.add_argument("--embedding_dim", type=int, default=256)
     args.add_argument("--encoder_hidden_dim", type=int, default=512)
     args.add_argument("--decoder_hidden_dim", type=int, default=512)
     args.add_argument("--encoder_num_layers", type=int, default=2)
     args.add_argument("--decoder_num_layers", type=int, default=2)
+    args.add_argument("--encoder_num_heads", type=int, default=8)
+    args.add_argument("--decoder_num_heads", type=int, default=8)
     args.add_argument("--encoder_dropout", type=float, default=0.5)
     args.add_argument("--decoder_dropout", type=float, default=0.5)
     args.add_argument("--encoder_bidirectional", default=False, action="store_true")
@@ -258,6 +262,7 @@ if __name__ == "__main__":
     args.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
     args.add_argument("--max_steps_scheduler_sampling", type=int, default=50000)
     args.add_argument("--attention", default=False, action="store_true")
+    args.add_argument("--label_smoothing", default=0.0, type=float, help="Label smoothing value for the loss function (default: 0.0)")
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
@@ -276,7 +281,7 @@ if __name__ == "__main__":
     )
 
     curriculum_levels = [
-        {"max_step": 100000, "max_len": 10, "batch_size": 1024, "accum_steps": 1},
+        # {"max_step": 100000, "max_len": 10, "batch_size": 1024, "accum_steps": 1},
         {"max_step": args.max_steps, "max_len": args.max_len, "batch_size": args.batch_size, "accum_steps": args.accum_steps},
     ]
 
@@ -310,25 +315,42 @@ if __name__ == "__main__":
     collator_eval = DynamicCollator(batch_sampler_eval)
     dataloader_eval = DataLoader(dataset_eval, batch_sampler=batch_sampler_eval, collate_fn=collator_eval)
 
-    logger.info("Creating model...")
-    model = LSTM(
-        embedding_dim=args.embedding_dim,
-        encoder_hidden_dim=args.encoder_hidden_dim,
-        decoder_hidden_dim=args.decoder_hidden_dim,
-        encoder_num_layers=args.encoder_num_layers,
-        decoder_num_layers=args.decoder_num_layers,
-        encoder_dropout=args.encoder_dropout,
-        decoder_dropout=args.decoder_dropout,
-        encoder_bidirectional=args.encoder_bidirectional,
-        vocab_size=args.vocab_size,
-        pad_idx=0,
-        attention=args.attention
-    )
+    if args.architecture == "transformer":
+        
+        logger.info("Creating model...")
+        model = Transformer(
+            embedding_dim=args.embedding_dim,
+            encoder_hidden_dim=args.encoder_hidden_dim,
+            decoder_hidden_dim=args.decoder_hidden_dim,
+            encoder_num_heads=args.encoder_num_heads,
+            decoder_num_heads=args.decoder_num_heads,
+            encoder_num_layers=args.encoder_num_layers,
+            decoder_num_layers=args.decoder_num_layers,
+            encoder_dropout=args.encoder_dropout,
+            decoder_dropout=args.decoder_dropout,
+            vocab_size=args.vocab_size,
+            pad_idx=0
+        )
+    else:
+        logger.info("Creating model...")
+        model = LSTM(
+            embedding_dim=args.embedding_dim,
+            encoder_hidden_dim=args.encoder_hidden_dim,
+            decoder_hidden_dim=args.decoder_hidden_dim,
+            encoder_num_layers=args.encoder_num_layers,
+            decoder_num_layers=args.decoder_num_layers,
+            encoder_dropout=args.encoder_dropout,
+            decoder_dropout=args.decoder_dropout,
+            encoder_bidirectional=args.encoder_bidirectional,
+            vocab_size=args.vocab_size,
+            pad_idx=0,
+            attention=args.attention
+        )
     model = model.to(args.device)
 
     init_params(model, weight_init_method=args.init_weight_method, bias_init_method=args.init_bias_method)
 
-    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     scheduler = WarmupScheduler(optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps)
     scheduler_sampling = SigmoidSchedulerSampling(

@@ -3,7 +3,7 @@ import torch.nn as nn
 import logging
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+# logger.setLevel(logging.INFO)
 
 class LSTM(nn.Module):
     def __init__(

@@ -1,6 +1,18 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from logging import getLogger
+import logging
+
+from utils.scheduler_sampling import LinearSchedulerSampling
+
+
+logger = getLogger(__name__)
+# logger.setLevel(logging.DEBUG)
+
+# handler = logging.StreamHandler()
+# handler.setLevel(logging.DEBUG)
+# logger.addHandler(handler)
 
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, model_dim, max_len=5000):
@@ -48,15 +60,25 @@ class MultiHeadAttention(nn.Module):
         K = K.transpose(1, 2)  # (batch_size, num_heads, seq_length, head_dim)
         V = V.transpose(1, 2)  # (batch_size, num_heads, seq_length, head_dim)
 
+        logger.debug(f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}")
+
         # Scaled dot-product attention
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (batch_size, num_heads, seq_length_q, seq_length_k)
         attn_weights = F.softmax(scores, dim=-1)  # (batch_size, num_heads, seq_length_q, seq_length_k)
         if attn_mask is not None:
+            logger.debug(f"Attention mask shape: {attn_mask.shape}, Attention weights shape: {attn_weights.shape}")
             attn_weights = attn_weights.masked_fill(attn_mask == float('-inf'), 0)
         attn_output = torch.matmul(attn_weights, V)  # (batch_size, num_heads, seq_length_q, head_dim)
 
+        logger.debug(f"Attention output shape: {attn_output.shape}")
+
         # Concatenate heads and put through final linear layer
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.head_dim)  # (batch_size, seq_length_q, model_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous() # (batch_size, seq_length_q, num_heads, head_dim)
+        logger.debug(f"Attention output after transpose shape: {attn_output.shape}")
+        
+        attn_output = attn_output.view(batch_size, -1, self.num_heads * self.head_dim)  # (batch_size, seq_length_q, model_dim)
+        
+        logger.debug(f"Attention output after concatenation shape: {attn_output.shape}")
         output = self.out(attn_output)  # (batch_size, seq_length_q, model_dim)
         return output
 
@@ -104,9 +126,9 @@ class TransformerDecoderLayer(nn.Module):
         return mask
 
     def forward(self, tgt, memory):
-        # tgt shape: (seq_length_tgt, batch_size, model_dim)
-        # memory shape: (seq_length_src, batch_size, model_dim)
-        mask = self.generate_square_subsequent_mask(tgt.size(0)).to(tgt.device)
+        # tgt shape: (batch_size, seq_length_tgt, model_dim)
+        # memory shape: (batch_size, seq_length_src, model_dim)
+        mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
         tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=mask)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -119,11 +141,20 @@ class TransformerDecoderLayer(nn.Module):
         return tgt
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, input_dim, model_dim, num_heads, num_layers, dropout=0.1):
+    def __init__(
+            self, 
+            embed_dim, 
+            model_dim, 
+            num_heads, 
+            num_layers, 
+            dropout=0.1, 
+            vocab_size=50_000,
+            pad_idx=0
+        ):
         super(TransformerEncoder, self).__init__()
         self.model_dim = model_dim
-        self.embedding = nn.Linear(input_dim, model_dim)
-        self.positional_encoding = SinusoidalPositionalEncoding(model_dim)
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.positional_encoding = SinusoidalPositionalEncoding(embed_dim)
         self.transformer_encoder = nn.ModuleList(
             [TransformerEncoderLayer(model_dim, num_heads, dropout) for _ in range(num_layers)]
         )
@@ -133,21 +164,35 @@ class TransformerEncoder(nn.Module):
         x = self.embedding(x)  # (batch_size, seq_length, model_dim)
         seq_length = x.size(1)
         x = x + self.positional_encoding(x)  # Add positional encoding
-        x = x.permute(1, 0, 2)  # (seq_length, batch_size, model_dim) for transformer
-        output = self.transformer_encoder(x)  # (seq_length, batch_size, model_dim)
-        output = output.permute(1, 0, 2)  # (batch_size, seq_length, model_dim)
+        logger.debug(f"Input shape after embedding and positional encoding: {x.shape}")
+        # x = x.permute(1, 0, 2)  # (seq_length, batch_size, model_dim) for transformer
+        output = x
+        for i, layer in enumerate(self.transformer_encoder):
+            logger.debug(f"Layer do encoder {i}:")
+            output = layer(output)
+        logger.debug(f"Output shape after encoder layers: {output.shape}")
+        # output = output.permute(1, 0, 2)  # (batch_size, seq_length, model_dim)
         return output
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, output_dim, model_dim, num_heads, num_layers, dropout=0.1):
+    def __init__(
+            self, 
+            embed_dim, 
+            model_dim, 
+            num_heads, 
+            num_layers, 
+            dropout=0.1, 
+            vocab_size=50_000,
+            pad_idx=0
+        ):
         super(TransformerDecoder, self).__init__()
         self.model_dim = model_dim
-        self.embedding = nn.Linear(output_dim, model_dim)
-        self.positional_encoding = SinusoidalPositionalEncoding(model_dim)
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
+        self.positional_encoding = SinusoidalPositionalEncoding(embed_dim)
         self.transformer_decoder = nn.ModuleList(
             [TransformerDecoderLayer(model_dim, num_heads, dropout) for _ in range(num_layers)]
         )
-        self.output_layer = nn.Linear(model_dim, output_dim)
+        self.output_layer = nn.Linear(model_dim, vocab_size)
 
     def forward(self, x, memory):
         # x shape: (batch_size, seq_length_tgt, output_dim)
@@ -155,22 +200,122 @@ class TransformerDecoder(nn.Module):
         x = self.embedding(x)  # (batch_size, seq_length_tgt, model_dim)
         seq_length = x.size(1)
         x = x + self.positional_encoding(x)  # Add positional encoding
-        x = x.permute(1, 0, 2)  # (seq_length_tgt, batch_size, model_dim) for transformer
-        memory = memory.permute(1, 0, 2)  # (seq_length_src, batch_size, model_dim)
-        output = self.transformer_decoder(x, memory)  # (seq_length_tgt, batch_size, model_dim)
-        output = output.permute(1, 0, 2)  # (batch_size, seq_length_tgt, model_dim)
+        # x = x.permute(1, 0, 2)  # (seq_length_tgt, batch_size, model_dim) for transformer
+        # memory = memory.permute(1, 0, 2)  # (seq_length_src, batch_size, model_dim)
+        output = x
+        for i, layer in enumerate(self.transformer_decoder):
+            logger.debug(f"Layer do decoder {i}:")
+            output = layer(output, memory)
+        logger.debug(f"Output shape after decoder layers: {output.shape}")
+        # output = output.permute(1, 0, 2)  # (batch_size, seq_length_tgt, model_dim)
         output = self.output_layer(output)  # (batch_size, seq_length_tgt, output_dim)
         return output
     
 class Transformer(nn.Module):
-    def __init__(self, input_dim, output_dim, model_dim, num_heads, num_layers, dropout=0.1):
+    def __init__(
+            self, 
+            embedding_dim,
+            encoder_hidden_dim,
+            decoder_hidden_dim,
+            encoder_num_layers,
+            decoder_num_layers,
+            encoder_num_heads,
+            decoder_num_heads,
+            encoder_dropout,
+            decoder_dropout,
+            vocab_size=50_000,
+            pad_idx=0
+        ):
         super(Transformer, self).__init__()
-        self.encoder = TransformerEncoder(input_dim, model_dim, num_heads, num_layers, dropout)
-        self.decoder = TransformerDecoder(output_dim, model_dim, num_heads, num_layers, dropout)
-
+        self.encoder = TransformerEncoder(
+            embedding_dim, 
+            encoder_hidden_dim, 
+            encoder_num_heads, 
+            encoder_num_layers, 
+            encoder_dropout, 
+            vocab_size,
+            pad_idx
+            )
+        self.decoder = TransformerDecoder(
+            embedding_dim, 
+            decoder_hidden_dim, 
+            decoder_num_heads, 
+            decoder_num_layers, 
+            decoder_dropout, 
+            vocab_size,
+            pad_idx
+            )
     def forward(self, src, tgt):
         # src shape: (batch_size, seq_length_src, input_dim)
         # tgt shape: (batch_size, seq_length_tgt, output_dim)
         memory = self.encoder(src)  # (batch_size, seq_length_src, model_dim)
         output = self.decoder(tgt, memory)  # (batch_size, seq_length_tgt, output_dim)
         return output
+    
+    def train_step(
+            self,
+            src: torch.Tensor,
+            tgt: torch.Tensor,
+            criterion: nn.Module,
+            teacher_forcing: bool = True,
+            bos_token_id: int = 5,
+            scheduler_sampling: LinearSchedulerSampling = None
+    ) -> torch.Tensor:
+        self.train()
+        output = self(src, tgt[:, :-1])  # Exclude the last token for teacher forcing
+
+        output_dim = output.shape[-1] # (vocab_size)
+        
+        output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
+
+        logger.debug(f'Output shape after reshape train step: {output.shape}')
+
+        tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
+        loss: torch.Tensor = criterion(output, tgt)
+
+        return loss
+    
+    def eval_step(
+            self,
+            src: torch.Tensor,
+            tgt: torch.Tensor,
+            criterion: nn.Module,
+            bos_token_id: int = 5
+    ) -> torch.Tensor:
+        self.eval()
+        with torch.no_grad():
+            output = self(src, tgt[:, :-1])  # Exclude the last token for evaluation
+
+            output_dim = output.shape[-1] # (vocab_size)
+            
+            output = output.reshape(-1, output_dim) # [batch_size * tgt_len, vocab_size]
+
+            logger.debug(f'Output shape after reshape eval step: {output.shape}')
+
+            tgt = tgt[:, 1:].flatten() # [tgt_len * batch_size]
+            loss: torch.Tensor = criterion(output, tgt)
+
+        return loss.item(), loss.item()
+    
+    def predict(
+            self,
+            src: torch.Tensor,
+            bos_token_id: int = 5,
+            eos_token_id: int = 6,
+            max_len: int = 128
+    ):
+        self.eval()
+        with torch.no_grad():
+            memory = self.encoder(src)
+            batch_size = src.size(0)
+            outputs = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=src.device)
+
+            for _ in range(max_len):
+                output = self.decoder(outputs, memory)
+                next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)  # Get the last token
+                outputs = torch.cat((outputs, next_token), dim=1)
+
+                if (next_token == eos_token_id).all():
+                    break
+
+        return outputs

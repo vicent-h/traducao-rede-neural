@@ -27,9 +27,9 @@
     "init_weight_method": "xavier_uniform",
     "init_bias_method": "zeros",
     "teacher_forcing": true,
-    "scheduler_sampling": false,
+    "scheduler_sampling": true,
     "teacher_forcing_ratio": 1.0,
-    "max_steps_scheduler_sampling": 50000,
+    "max_steps_scheduler_sampling": 200000,
     "attention": true,
     "curriculum_levels": [
         {

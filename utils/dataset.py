@@ -22,7 +22,7 @@ class TranslateDataset(Dataset):
             src = self.tokens_src[idx]
             tgt = self.tokens_tgt[idx]
 
-        src = src[1:]  # Remove <BOS>
+        # src = src[1:]  # Remove <BOS>
 
         # Trunca para um comprimento máximo, mas NÃO aplica padding aqui.
         src = list(src[:self.max_len])

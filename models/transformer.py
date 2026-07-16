@@ -316,17 +316,32 @@ class Transformer(nn.Module):
         with torch.no_grad():
             memory = self.encoder(src)
             batch_size = src.size(0)
-            outputs = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=src.device)
-            outputs_input = self.embedding(outputs)
-            outputs_input = outputs_input + self.positional_encoding(outputs_input)
+            device = src.device
+            outputs = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
+
+            # Compute embedding+pos for the initial BOS token once and then append
+            outputs_input = self.embedding(outputs)  # (B, 1, E)
+            # positional encoding buffer is stored in self.positional_encoding.pe
+            pos0 = self.positional_encoding.pe[:, :1, :].to(device)
+            outputs_input = outputs_input + pos0
+
+            seq_len = 1
 
             for _ in range(max_len):
                 output = self.decoder(outputs_input, memory)
-                next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)  # Get the last token
+                next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)  # (B, 1)
+
                 outputs = torch.cat((outputs, next_token), dim=1)
 
-                outputs_input = self.embedding(outputs)
-                outputs_input = outputs_input + self.positional_encoding(outputs_input)
+                seq_len += 1
+
+                # Compute embedding for only the new token and append (avoid re-embedding entire sequence)
+                next_emb = self.embedding(next_token)  # (B, 1, E)
+                # slice positional encoding for the new position (index seq_len-1)
+                pos_new = self.positional_encoding.pe[:, seq_len-1:seq_len, :].to(device)  # (1,1,E)
+                next_emb = next_emb + pos_new
+
+                outputs_input = torch.cat((outputs_input, next_emb), dim=1)
 
                 if (next_token == eos_token_id).all():
                     break

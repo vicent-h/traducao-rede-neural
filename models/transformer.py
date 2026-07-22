@@ -154,7 +154,7 @@ class TransformerDecoderLayer(nn.Module):
         super(TransformerDecoderLayer, self).__init__()
         # self-attention in decoder should not use kv cache when generating
         # (we accumulate the full tgt sequence and do not rely on incremental self-attn caching)
-        self.self_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False)
+        self.self_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=kv_cache)
         self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=kv_cache)
         self.linear1 = nn.Linear(model_dim, model_dim * 4)
         self.dropout = nn.Dropout(dropout)
@@ -396,7 +396,7 @@ class Transformer(nn.Module):
                 next_emb = next_emb + pos_new
 
                 # Pass entire accumulated sequence to decoder, not just the new token
-                outputs_input = torch.cat((outputs_input, next_emb), dim=1)
+                outputs_input = next_emb
 
                 if (next_token == eos_token_id).all():
                     break

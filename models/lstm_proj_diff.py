@@ -374,7 +374,8 @@ class LSTM(nn.Module):
         src,
         bos_token_id,
         eos_token_id,
-        max_len=128
+        max_len=128,
+        reset_cache: bool = False
     ):
 
         self.eval()

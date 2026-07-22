@@ -34,7 +34,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.pe[:, :seq_length, :].to(x.device)  # Return positional encoding for the input sequence length
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self, model_dim, num_heads):
+    def __init__(self, model_dim, num_heads, kv_cache=True):
         super(MultiHeadAttention, self).__init__()
         assert model_dim % num_heads == 0, "model_dim must be divisible by num_heads"
         self.num_heads = num_heads
@@ -46,6 +46,17 @@ class MultiHeadAttention(nn.Module):
         self.out = nn.Linear(model_dim, model_dim)
 
         self.map_attention = None  # Para armazenar os pesos de atenção para depuração
+        
+        self.kv_cache = kv_cache
+
+        # Initialize caches as None and create on first use to avoid
+        # shape-mismatch when concatenating along the sequence dimension.
+        self.k_cache = None
+        self.v_cache = None
+
+    def reset_kv_cache(self):
+        self.k_cache = None
+        self.v_cache = None
 
     def forward(
             self, 
@@ -56,9 +67,28 @@ class MultiHeadAttention(nn.Module):
             ):
         batch_size = query.size(0)
 
-        Q = self.query(query)  # (batch_size, seq_length, model_dim)
-        K = self.key(key)      # (batch_size, seq_length, model_dim)
-        V = self.value(value)  # (batch_size, seq_length, model_dim)
+        if self.kv_cache:
+            cur_k = self.key(key[:, -1:, :])      # (batch_size, seq_length, model_dim)
+            cur_v = self.value(value[:, -1:, :])  # (batch_size, seq_length, model_dim)
+
+            if self.k_cache is None or self.v_cache is None:
+                self.k_cache = cur_k.to(key.device)
+                self.v_cache = cur_v.to(value.device)
+            else:
+                self.k_cache = torch.cat([self.k_cache.to(key.device), cur_k], dim=1)
+                self.v_cache = torch.cat([self.v_cache.to(value.device), cur_v], dim=1)
+
+            K = self.k_cache  # (batch_size, seq_length_k, model_dim)
+            V = self.v_cache
+        else:
+            K = self.key(key)      # (batch_size, seq_length, model_dim)
+            V = self.value(value)  # (batch_size, seq_length, model_dim)
+        
+        Q: torch.Tensor = self.query(query)  # (batch_size, seq_length, model_dim)
+        
+        # if(attn_mask is not None):
+        #     print(f'Kv cache: {self.kv_cache}, Reset cache: {reset_cache}')
+        #     print(f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}")
 
         Q = Q.view(batch_size, -1, self.num_heads, self.head_dim) # (batch_size, seq_length, num_heads, head_dim)
         K = K.view(batch_size, -1, self.num_heads, self.head_dim) # (batch_size, seq_length, num_heads, head_dim)
@@ -98,7 +128,9 @@ class MultiHeadAttention(nn.Module):
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, model_dim, num_heads, dropout=0.1):
         super(TransformerEncoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(model_dim, num_heads)
+        # Disable kv_cache for encoder self-attention to avoid cache persisting across
+        # different batches (which may have different batch sizes).
+        self.self_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False)
         self.linear1 = nn.Linear(model_dim, model_dim * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(model_dim * 4, model_dim)
@@ -118,10 +150,12 @@ class TransformerEncoderLayer(nn.Module):
         return src
     
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, model_dim, num_heads, dropout=0.1):
+    def __init__(self, model_dim, num_heads, dropout=0.1, kv_cache=False):
         super(TransformerDecoderLayer, self).__init__()
-        self.self_attn = MultiHeadAttention(model_dim, num_heads)
-        self.multihead_attn = MultiHeadAttention(model_dim, num_heads)
+        # self-attention in decoder should not use kv cache when generating
+        # (we accumulate the full tgt sequence and do not rely on incremental self-attn caching)
+        self.self_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False)
+        self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=kv_cache)
         self.linear1 = nn.Linear(model_dim, model_dim * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(model_dim * 4, model_dim)
@@ -131,6 +165,7 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
+        self.kv_cache = kv_cache
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -188,11 +223,12 @@ class TransformerDecoder(nn.Module):
             num_layers, 
             dropout=0.1, 
             vocab_size=50_000,
+            kv_cache=False
         ):
         super(TransformerDecoder, self).__init__()
         self.model_dim = model_dim
         self.transformer_decoder = nn.ModuleList(
-            [TransformerDecoderLayer(model_dim, num_heads, dropout) for _ in range(num_layers)]
+            [TransformerDecoderLayer(model_dim, num_heads, dropout, kv_cache=kv_cache) for _ in range(num_layers)]
         )
         self.output_layer = nn.Linear(model_dim, vocab_size)
 
@@ -223,9 +259,11 @@ class Transformer(nn.Module):
             encoder_dropout,
             decoder_dropout,
             vocab_size=50_000,
-            pad_idx=0
+            pad_idx=0,
+            kv_cache=False
         ):
         super(Transformer, self).__init__()
+        self.kv_cache = kv_cache
         self.encoder = TransformerEncoder(
             embedding_dim, 
             encoder_hidden_dim, 
@@ -239,12 +277,22 @@ class Transformer(nn.Module):
             decoder_num_heads, 
             decoder_num_layers, 
             decoder_dropout, 
-            vocab_size
+            vocab_size,
+            kv_cache=kv_cache
             )
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_idx)
         self.positional_encoding = SinusoidalPositionalEncoding(embedding_dim)
 
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor):
+    def reset_kv_cache(self):
+        # Reset any kv caches present in decoder layers (self and cross attention)
+        for layer in self.decoder.transformer_decoder:
+            layer.self_attn.reset_kv_cache()
+            layer.multihead_attn.reset_kv_cache()
+
+    def forward(
+            self, 
+            src: torch.Tensor, 
+            tgt: torch.Tensor):
         src = self.embedding(src)
         src = src + self.positional_encoding(src)
         src = src.float()
@@ -308,11 +356,18 @@ class Transformer(nn.Module):
             src: torch.Tensor,
             bos_token_id: int = 5,
             eos_token_id: int = 6,
-            max_len: int = 128
+            max_len: int = 128,
+            reset_cache: bool = False
     ):
         self.eval()
+        
+        # Reset cache at the beginning of each prediction
+        if reset_cache:
+            self.reset_kv_cache()
+        
         src = self.embedding(src)
         src = src + self.positional_encoding(src)
+
         with torch.no_grad():
             memory = self.encoder(src)
             batch_size = src.size(0)
@@ -328,19 +383,19 @@ class Transformer(nn.Module):
             seq_len = 1
 
             for _ in range(max_len):
-                output = self.decoder(outputs_input, memory)
+                output = self.decoder(outputs_input, memory)  # (B, seq_len, vocab_size)
                 next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)  # (B, 1)
 
                 outputs = torch.cat((outputs, next_token), dim=1)
 
                 seq_len += 1
 
-                # Compute embedding for only the new token and append (avoid re-embedding entire sequence)
+                # Accumulate the entire sequence for next decoder call
                 next_emb = self.embedding(next_token)  # (B, 1, E)
-                # slice positional encoding for the new position (index seq_len-1)
-                pos_new = self.positional_encoding.pe[:, seq_len-1:seq_len, :].to(device)  # (1,1,E)
+                pos_new = self.positional_encoding.pe[:, seq_len-1:seq_len, :].to(device)
                 next_emb = next_emb + pos_new
 
+                # Pass entire accumulated sequence to decoder, not just the new token
                 outputs_input = torch.cat((outputs_input, next_emb), dim=1)
 
                 if (next_token == eos_token_id).all():

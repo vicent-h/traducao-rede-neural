@@ -66,29 +66,46 @@ class MultiHeadAttention(nn.Module):
             attn_mask: torch.Tensor=None
             ):
         batch_size = query.size(0)
-
         if self.kv_cache:
-            cur_k = self.key(key[:, -1:, :])      # (batch_size, seq_length, model_dim)
-            cur_v = self.value(value[:, -1:, :])  # (batch_size, seq_length, model_dim)
+            # If key/value contain a single time-step, treat as incremental generation
+            # and append the new k/v to the cache. If a full sequence is provided
+            # (initial call), compute full K/V and initialize the cache.
+            if key.size(1) == 1:
+                cur_k = self.key(key)      # (batch_size, 1, model_dim)
+                cur_v = self.value(value)  # (batch_size, 1, model_dim)
 
-            if self.k_cache is None or self.v_cache is None:
-                self.k_cache = cur_k.to(key.device)
-                self.v_cache = cur_v.to(value.device)
+                if self.k_cache is None or self.v_cache is None:
+                    self.k_cache = cur_k.to(key.device)
+                    self.v_cache = cur_v.to(value.device)
+                else:
+                    self.k_cache = torch.cat([self.k_cache.to(key.device), cur_k], dim=1)
+                    self.v_cache = torch.cat([self.v_cache.to(value.device), cur_v], dim=1)
+
+                K = self.k_cache  # (batch_size, seq_length_k, model_dim)
+                V = self.v_cache
             else:
-                self.k_cache = torch.cat([self.k_cache.to(key.device), cur_k], dim=1)
-                self.v_cache = torch.cat([self.v_cache.to(value.device), cur_v], dim=1)
+                # Full sequence provided: compute K/V for the whole input and
+                # initialize the caches so subsequent incremental calls work.
+                K = self.key(key)      # (batch_size, seq_length, model_dim)
+                V = self.value(value)  # (batch_size, seq_length, model_dim)
+                self.k_cache = K.to(key.device)
+                self.v_cache = V.to(value.device)
 
-            K = self.k_cache  # (batch_size, seq_length_k, model_dim)
-            V = self.v_cache
+            # Queries: allow full or single-step queries; compute normally.
+            Q = self.query(query)
         else:
             K = self.key(key)      # (batch_size, seq_length, model_dim)
             V = self.value(value)  # (batch_size, seq_length, model_dim)
+            Q = self.query(query)  # (batch_size, seq_length, model_dim)
+            
+
+        logger.debug(f'{query.shape=}')
         
-        Q: torch.Tensor = self.query(query)  # (batch_size, seq_length, model_dim)
+        
         
         # if(attn_mask is not None):
-        #     print(f'Kv cache: {self.kv_cache}, Reset cache: {reset_cache}')
-        #     print(f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}")
+        #     logger.debug(f'Kv cache: {self.kv_cache}, Reset cache: {reset_cache}')
+        #     logger.debug(f"Q shape: {Q.shape}, K shape: {K.shape}, V shape: {V.shape}")
 
         Q = Q.view(batch_size, -1, self.num_heads, self.head_dim) # (batch_size, seq_length, num_heads, head_dim)
         K = K.view(batch_size, -1, self.num_heads, self.head_dim) # (batch_size, seq_length, num_heads, head_dim)
@@ -155,7 +172,10 @@ class TransformerDecoderLayer(nn.Module):
         # self-attention in decoder should not use kv cache when generating
         # (we accumulate the full tgt sequence and do not rely on incremental self-attn caching)
         self.self_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=kv_cache)
-        self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=kv_cache)
+        # Cross-attention should use the full encoder memory every step;
+        # do not enable kv_cache for cross-attention (it would incorrectly
+        # append encoder keys across decoding steps).
+        self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False)
         self.linear1 = nn.Linear(model_dim, model_dim * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(model_dim * 4, model_dim)
@@ -166,6 +186,7 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
         self.kv_cache = kv_cache
+        self.actual_size_tgt = 0  # To track the actual size of the target sequence during generation
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -175,7 +196,17 @@ class TransformerDecoderLayer(nn.Module):
     def forward(self, tgt, memory):
         # tgt shape: (batch_size, seq_length_tgt, model_dim)
         # memory shape: (batch_size, seq_length_src, model_dim)
-        mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
+        if self.kv_cache:
+            if self.self_attn.k_cache is None or tgt.size(1) != 1:
+                # First call or full target sequence passed; use current tgt length.
+                self.actual_size_tgt = tgt.size(1)
+            else:
+                # Incremental generation with a single new token.
+                self.actual_size_tgt += 1
+        else:
+            self.actual_size_tgt = tgt.size(1)
+        logger.debug(f'self.actual_size_tgt: {self.actual_size_tgt}')
+        mask = self.generate_square_subsequent_mask(self.actual_size_tgt).to(tgt.device)
         tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=mask)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -285,9 +316,11 @@ class Transformer(nn.Module):
 
     def reset_kv_cache(self):
         # Reset any kv caches present in decoder layers (self and cross attention)
+        logger.debug("----*Resetting KV cache for all decoder layers.*----")
         for layer in self.decoder.transformer_decoder:
             layer.self_attn.reset_kv_cache()
             layer.multihead_attn.reset_kv_cache()
+            layer.actual_size_tgt = 0
 
     def forward(
             self, 
@@ -357,6 +390,7 @@ class Transformer(nn.Module):
             bos_token_id: int = 5,
             eos_token_id: int = 6,
             max_len: int = 128,
+            kv_cache = False,
             reset_cache: bool = False
     ):
         self.eval()
@@ -383,6 +417,8 @@ class Transformer(nn.Module):
             seq_len = 1
 
             for _ in range(max_len):
+
+                logger.debug(f'{seq_len=}, {outputs_input.shape=}')
                 output = self.decoder(outputs_input, memory)  # (B, seq_len, vocab_size)
                 next_token = output[:, -1, :].argmax(dim=-1, keepdim=True)  # (B, 1)
 
@@ -396,7 +432,12 @@ class Transformer(nn.Module):
                 next_emb = next_emb + pos_new
 
                 # Pass entire accumulated sequence to decoder, not just the new token
-                outputs_input = next_emb
+                if kv_cache:
+                    # If using kv_cache, we can just pass the new token embedding
+                    outputs_input = next_emb
+                else:
+                    # If not using kv_cache, we need to pass the entire sequence
+                    outputs_input = torch.cat((outputs_input, next_emb), dim=1)
 
                 if (next_token == eos_token_id).all():
                     break

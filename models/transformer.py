@@ -208,7 +208,6 @@ class TransformerDecoderLayer(nn.Module):
             mask = None
         else:
             mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
-        logger.debug(f'self.actual_size_tgt: {self.actual_size_tgt}')
         
         tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=mask)
         tgt = tgt + self.dropout1(tgt2)

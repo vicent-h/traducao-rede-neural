@@ -34,7 +34,7 @@ class SinusoidalPositionalEncoding(nn.Module):
         return self.pe[:, :seq_length, :].to(x.device)  # Return positional encoding for the input sequence length
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self, model_dim, num_heads, kv_cache=True):
+    def __init__(self, model_dim, num_heads, kv_cache=True, cross_attn=False):
         super(MultiHeadAttention, self).__init__()
         assert model_dim % num_heads == 0, "model_dim must be divisible by num_heads"
         self.num_heads = num_heads
@@ -53,6 +53,7 @@ class MultiHeadAttention(nn.Module):
         # shape-mismatch when concatenating along the sequence dimension.
         self.k_cache = None
         self.v_cache = None
+        self.cross_attn = cross_attn
 
     def reset_kv_cache(self):
         self.k_cache = None
@@ -92,6 +93,13 @@ class MultiHeadAttention(nn.Module):
                 self.v_cache = V.to(value.device)
 
             # Queries: allow full or single-step queries; compute normally.
+            Q = self.query(query)
+        elif self.cross_attn:
+            if self.k_cache is None or self.v_cache is None:
+                self.k_cache = self.key(key)      # (batch_size, seq_length, model_dim)
+                self.v_cache = self.value(value)  # (batch_size, seq_length, model_dim)
+            K = self.k_cache
+            V = self.v_cache
             Q = self.query(query)
         else:
             K = self.key(key)      # (batch_size, seq_length, model_dim)
@@ -175,7 +183,7 @@ class TransformerDecoderLayer(nn.Module):
         # Cross-attention should use the full encoder memory every step;
         # do not enable kv_cache for cross-attention (it would incorrectly
         # append encoder keys across decoding steps).
-        self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False)
+        self.multihead_attn = MultiHeadAttention(model_dim, num_heads, kv_cache=False, cross_attn=True)
         self.linear1 = nn.Linear(model_dim, model_dim * 4)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(model_dim * 4, model_dim)
@@ -197,16 +205,11 @@ class TransformerDecoderLayer(nn.Module):
         # tgt shape: (batch_size, seq_length_tgt, model_dim)
         # memory shape: (batch_size, seq_length_src, model_dim)
         if self.kv_cache:
-            if self.self_attn.k_cache is None or tgt.size(1) != 1:
-                # First call or full target sequence passed; use current tgt length.
-                self.actual_size_tgt = tgt.size(1)
-            else:
-                # Incremental generation with a single new token.
-                self.actual_size_tgt += 1
+            mask = None
         else:
-            self.actual_size_tgt = tgt.size(1)
+            mask = self.generate_square_subsequent_mask(tgt.size(1)).to(tgt.device)
         logger.debug(f'self.actual_size_tgt: {self.actual_size_tgt}')
-        mask = self.generate_square_subsequent_mask(self.actual_size_tgt).to(tgt.device)
+        
         tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=mask)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)

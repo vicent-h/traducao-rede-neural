@@ -1,23 +1,23 @@
 {
     "invert_src": false,
     "architecture": "transformer",
-    "embedding_dim": 768,
-    "encoder_hidden_dim": 768,
-    "decoder_hidden_dim": 768,
+    "embedding_dim": 512,
+    "encoder_hidden_dim": 512,
+    "decoder_hidden_dim": 512,
     "encoder_num_layers": 4,
     "decoder_num_layers": 4,
-    "encoder_num_heads": 8,
-    "decoder_num_heads": 8,
-    "encoder_dropout": 0.3,
-    "decoder_dropout": 0.3,
+    "encoder_num_heads": 4,
+    "decoder_num_heads": 4,
+    "encoder_dropout": 0.0,
+    "decoder_dropout": 0.0,
     "encoder_bidirectional": false,
-    "batch_size": 16,
-    "accum_steps": 12,
+    "batch_size": 192,
+    "accum_steps": 2,
     "log_steps": 250,
     "save_steps": 1000,
     "eval_steps": 500,
     "device": "cuda",
-    "desc": "Treinando um transformer parrudão",
+    "desc": "Separando as camadas de embedding para ter um melhor aprendizado, dado que o modelo é relativamente pequeno (em relação ao v65). Pelo que foi observado nos estudos, ter um embedding separado para modelos pequenos ajuda no aprendizado pois são linguagens diferentes que a mesma palavra possui ordem diferente na escrita delas, e separando os embeddings garante que eles aprenda o significado de cada token em diferentes posições em diferentes linguas, já que o positional encoding tem interferencia no aprendizado (de forma positiva)",
     "name": "v66",
     "early_stop_patience": 100,
     "early_stop_min_delta": 0.0,
@@ -35,12 +35,13 @@
     "max_steps_scheduler_sampling": 50000,
     "attention": true,
     "label_smoothing": 0.0,
+    "separate_embedding": true,
     "curriculum_levels": [
         {
             "max_step": 500000,
             "max_len": 30,
-            "batch_size": 16,
-            "accum_steps": 12
+            "batch_size": 192,
+            "accum_steps": 2
         }
     ]
 }

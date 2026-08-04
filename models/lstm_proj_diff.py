@@ -401,15 +401,13 @@ class LSTM(nn.Module):
 
             # current_token -> [batch_size, 1]
 
-            generated_tokens = []
+            outputs = []
 
             finished = torch.zeros(
                 batch_size,
                 dtype=torch.bool,
                 device=device
             )
-
-            # finished -> [batch_size]
 
             for _ in range(max_len):
 
@@ -429,24 +427,25 @@ class LSTM(nn.Module):
                 # predictions[:, -1] -> [batch_size, vocab_size]
                 # next_token -> [batch_size]
 
-                generated_tokens.append(next_token)
-
-                # generated_tokens -> list de tensors [batch_size]
+                # outputs -> list de tensors [batch_size]
 
                 finished |= (next_token == eos_token_id)
 
                 # (next_token == eos_token_id) -> [batch_size]
                 # finished -> [batch_size]
 
+                # Preenche apenas as sequências ainda ativas
+                for i in range(batch_size):
+                    if not finished[i]:
+                        outputs[i].append(int(next_token[i, 0].item()))
+
+                finished = finished | (next_token.squeeze(1) == eos_token_id)
                 if finished.all():
                     break
-
                 current_token = next_token.unsqueeze(1)
 
                 # current_token -> [batch_size, 1]
 
-            generated_tokens = torch.stack(generated_tokens, dim=1)
-
             # generated_tokens -> [batch_size, generated_seq_len]
 
-            return generated_tokens
+            return torch.tensor(outputs, dtype=torch.long, device=device)

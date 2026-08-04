@@ -263,6 +263,7 @@ if __name__ == "__main__":
     args.add_argument("--max_steps_scheduler_sampling", type=int, default=50000)
     args.add_argument("--attention", default=False, action="store_true")
     args.add_argument("--label_smoothing", default=0.0, type=float, help="Label smoothing value for the loss function (default: 0.0)")
+    args.add_argument("--separate_embedding", default=False, action="store_true")
     args = args.parse_args()
 
     logger.info(f'Starting training - {args.desc}')
@@ -329,7 +330,10 @@ if __name__ == "__main__":
             encoder_dropout=args.encoder_dropout,
             decoder_dropout=args.decoder_dropout,
             vocab_size=args.vocab_size,
-            pad_idx=0
+            kv_cache=False,
+            cross_attn_cache=False,
+            pad_idx=0,
+            separate_embedding=args.separate_embedding
         )
     else:
         logger.info("Creating model...")

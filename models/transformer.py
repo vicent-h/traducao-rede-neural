@@ -486,4 +486,4 @@ class Transformer(nn.Module):
                     break
 
 
-        return torch.tensor(outputs, dtype=torch.long, device=device)
+        return outputs

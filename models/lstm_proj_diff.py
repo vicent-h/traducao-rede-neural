@@ -375,7 +375,8 @@ class LSTM(nn.Module):
         bos_token_id,
         eos_token_id,
         max_len=128,
-        reset_cache: bool = False
+        reset_cache: bool = False,
+        kv_cache: bool = False
     ):
 
         self.eval()
@@ -401,7 +402,7 @@ class LSTM(nn.Module):
 
             # current_token -> [batch_size, 1]
 
-            outputs = []
+            outputs = [[bos_token_id] for _ in range(batch_size)]
 
             finished = torch.zeros(
                 batch_size,
@@ -437,9 +438,9 @@ class LSTM(nn.Module):
                 # Preenche apenas as sequências ainda ativas
                 for i in range(batch_size):
                     if not finished[i]:
-                        outputs[i].append(int(next_token[i, 0].item()))
+                        outputs[i].append(int(next_token[i].item()))
 
-                finished = finished | (next_token.squeeze(1) == eos_token_id)
+                finished = finished | (next_token == eos_token_id)
                 if finished.all():
                     break
                 current_token = next_token.unsqueeze(1)
@@ -448,4 +449,4 @@ class LSTM(nn.Module):
 
             # generated_tokens -> [batch_size, generated_seq_len]
 
-            return torch.tensor(outputs, dtype=torch.long, device=device)
+            return outputs

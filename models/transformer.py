@@ -196,7 +196,6 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
         self.kv_cache = kv_cache
-        self.actual_size_tgt = 0  # To track the actual size of the target sequence during generation
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)

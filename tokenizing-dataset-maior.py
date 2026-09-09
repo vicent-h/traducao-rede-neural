@@ -1,6 +1,16 @@
 import os
 import gc
+import json
+import time
+import multiprocessing as mp
 import math
+
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    wait,
+    FIRST_COMPLETED,
+)
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -14,157 +24,319 @@ from tokenizers import Tokenizer
 # CONFIGURAÇÕES
 # ============================================================
 
-TSV_PATH = "/media/alvarinho/dados/Datasets/refined/traducao/analise_textos.tsv"
-SPLIT_PARQUET_PATH = "/media/alvarinho/dados/Datasets/refined/traducao/analise_textos_split.parquet"
-
-# Novo dataset tokenizado
-OUTPUT_DIR = "/media/alvarinho/dados/Datasets/refined/traducao/tokenized"
-
-# Parquet com a referência dos NPZs
-OUTPUT_SPLIT_PARQUET = os.path.join(
-    OUTPUT_DIR,
-    "analise_textos_tokenized_split.parquet"
+TSV_PATH = (
+    "/media/alvarinho/dados/Datasets/refined/traducao/"
+    "analise_textos.tsv"
 )
 
-# Tokenizer já treinado
-TOKENIZER_PATH = "artifacts/tokenizer_en_pt_es_120000.json"
+SPLIT_PARQUET_PATH = (
+    "/media/alvarinho/dados/Datasets/refined/traducao/"
+    "analise_textos_split.parquet"
+)
 
-# Comprimento máximo
+OUTPUT_DIR = (
+    "/media/alvarinho/dados/Datasets/refined/traducao/"
+    "tokenized"
+)
+
+OUTPUT_SPLIT_PARQUET = os.path.join(
+    OUTPUT_DIR,
+    "analise_textos_tokenized_split.parquet",
+)
+
+TOKENIZER_PATH = (
+    "artifacts/tokenizer_en_pt_es_120000.json"
+)
+
+
+# ============================================================
+# PARÂMETROS
+# ============================================================
+
 MAX_SRC_LENGTH = 256
 MAX_TGT_LENGTH = 256
 
-# Quantidade de exemplos por NPZ
+# Exemplos por NPZ
 NPZ_CHUNK_SIZE = 100_000
 
-# Número de linhas lidas do Parquet por vez
-PARQUET_BATCH_SIZE = 1_000_000
+# Quantas linhas do Parquet/TSV são lidas por vez
+PARQUET_BATCH_SIZE = 10_000
 
-# Número de linhas processadas do TSV por vez
-TSV_BATCH_SIZE = 10_000
+# Quantos batches podem ficar simultaneamente nos workers
+MAX_PENDING = 16
+
+# Número de processos de tokenização
+MAX_WORKERS = 16
 
 
 # ============================================================
-# CARREGA OS ÍNDICES DO SPLIT
+# CHECKPOINT
 # ============================================================
 
-def load_split_indices(parquet_path, batch_size=1_000_000):
+CHECKPOINT_PATH = os.path.join(
+    OUTPUT_DIR,
+    "checkpoint.json",
+)
+
+
+# ============================================================
+# CONFIGURAÇÃO DO PROCESSAMENTO
+# ============================================================
+
+CONFIG_PATH = os.path.join(
+    OUTPUT_DIR,
+    "processing_config.json",
+)
+
+
+# ============================================================
+# EVITA OVERSUBSCRIPTION
+# ============================================================
+
+os.environ.setdefault(
+    "TOKENIZERS_PARALLELISM",
+    "false",
+)
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+def atomic_write_json(path, data):
     """
-    Carrega dataset_id + index + split do Parquet original.
+    Escreve JSON de forma atômica.
 
-    Retorna:
-        {
-            "train": {
-                dataset_id: set(indices),
-                ...
-            },
-            "valid": {...},
-            "test": {...}
-        }
+    Nunca sobrescreve diretamente o checkpoint.
     """
 
-    print("Carregando índices do split...")
+    temp_path = path + ".tmp"
 
-    parquet_file = pq.ParquetFile(parquet_path)
+    with open(
+        temp_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
 
-    split_indices = {
-        "train": {},
-        "valid": {},
-        "test": {}
-    }
-
-    total_rows = parquet_file.metadata.num_rows
-
-    with tqdm(
-        total=total_rows,
-        desc="Mapeando split",
-        unit="linhas"
-    ) as pbar:
-
-        for batch in parquet_file.iter_batches(
-            batch_size=batch_size,
-            columns=["dataset_id", "index", "split"]
-        ):
-
-            rows = batch.num_rows
-            df = batch.to_pandas()
-
-            for split_name, group_split in df.groupby("split", observed=True):
-
-                if split_name not in split_indices:
-                    split_indices[split_name] = {}
-
-                for dataset_id, group_dataset in group_split.groupby(
-                    "dataset_id",
-                    observed=True
-                ):
-                    split_indices[split_name].setdefault(dataset_id, set())
-
-                    split_indices[split_name][dataset_id].update(
-                        group_dataset["index"].astype(np.int64).tolist()
-                    )
-
-            del df
-            gc.collect()
-
-            pbar.update(rows)
-
-    print("\nDistribuição encontrada:")
-
-    for split_name, datasets in split_indices.items():
-
-        total = sum(len(indices) for indices in datasets.values())
-
-        print(
-            f"  - {split_name}: {total:,}".replace(",", ".")
+        json.dump(
+            data,
+            f,
+            indent=2,
+            ensure_ascii=False,
         )
 
-        for dataset_id, indices in datasets.items():
-            print(
-                f"      {dataset_id}: {len(indices):,}".replace(",", ".")
-            )
+        f.flush()
+        os.fsync(f.fileno())
 
-    return split_indices
+    os.replace(
+        temp_path,
+        path,
+    )
+
+
+def load_checkpoint():
+    """
+    Carrega o checkpoint existente.
+
+    Se não existir, começa do zero.
+    """
+
+    if not os.path.exists(
+        CHECKPOINT_PATH
+    ):
+        return {
+            "tsv_rows_consumed": 0,
+            "processed_examples": 0,
+            "train_chunks": 0,
+            "val_chunks": 0,
+            "test_chunks": 0,
+        }
+
+    print(
+        f"\nCheckpoint encontrado:"
+        f"\n  {CHECKPOINT_PATH}"
+    )
+
+    try:
+
+        with open(
+            CHECKPOINT_PATH,
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            checkpoint = json.load(f)
+
+        return checkpoint
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            "Não foi possível ler o checkpoint.\n"
+            f"Arquivo: {CHECKPOINT_PATH}\n"
+            f"Erro: {exc}"
+        )
+
+
+def save_checkpoint(
+    tsv_rows_consumed,
+    processed_examples,
+    writers,
+):
+    """
+    Salva checkpoint somente depois que os dados
+    correspondentes já foram gravados com sucesso.
+    """
+
+    checkpoint = {
+        "tsv_rows_consumed": int(
+            tsv_rows_consumed
+        ),
+
+        "processed_examples": int(
+            processed_examples
+        ),
+
+        "train_chunks": int(
+            writers["train"].chunk_id
+        ),
+
+        "val_chunks": int(
+            writers["val"].chunk_id
+        ),
+
+        "test_chunks": int(
+            writers["test"].chunk_id
+        ),
+
+        "updated_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    }
+
+    atomic_write_json(
+        CHECKPOINT_PATH,
+        checkpoint,
+    )
+
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+def get_processing_config():
+    return {
+        "tsv_path": os.path.abspath(
+            TSV_PATH
+        ),
+
+        "split_parquet_path": os.path.abspath(
+            SPLIT_PARQUET_PATH
+        ),
+
+        "tokenizer_path": os.path.abspath(
+            TOKENIZER_PATH
+        ),
+
+        "max_src_length": MAX_SRC_LENGTH,
+        "max_tgt_length": MAX_TGT_LENGTH,
+        "npz_chunk_size": NPZ_CHUNK_SIZE,
+        "parquet_batch_size": PARQUET_BATCH_SIZE,
+    }
+
+
+def verify_processing_config():
+    """
+    Impede continuar um checkpoint com uma configuração
+    diferente da utilizada originalmente.
+    """
+
+    current_config = get_processing_config()
+
+    if not os.path.exists(
+        CONFIG_PATH
+    ):
+
+        atomic_write_json(
+            CONFIG_PATH,
+            current_config,
+        )
+
+        return
+
+    with open(
+        CONFIG_PATH,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        old_config = json.load(f)
+
+    if old_config != current_config:
+
+        print("\nConfiguração anterior:")
+        print(
+            json.dumps(
+                old_config,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+
+        print("\nConfiguração atual:")
+        print(
+            json.dumps(
+                current_config,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+
+        raise RuntimeError(
+            "\nA configuração mudou desde o último processamento.\n"
+            "Para evitar corromper/duplicar o dataset, "
+            "não continuarei automaticamente.\n\n"
+            "Se realmente quiser começar do zero, remova:\n"
+            f"  {CHECKPOINT_PATH}\n"
+            f"  {CONFIG_PATH}\n"
+            "e os NPZ/metadata gerados."
+        )
 
 
 # ============================================================
 # PADDING
 # ============================================================
 
-def pad_tokens(tokens, max_length, pad_id):
+def pad_tokens(
+    tokens,
+    max_length,
+    pad_id,
+):
     """
-    Trunca e faz padding de uma sequência.
-
-    Retorna:
-        padded_tokens
-        original_length após truncamento
+    Trunca e faz padding.
     """
 
-    # Mantém espaço para EOS caso a sequência ultrapasse o limite.
     tokens = tokens[:max_length]
 
     length = len(tokens)
 
     if length < max_length:
-        tokens = tokens + [pad_id] * (max_length - length)
+
+        tokens = (
+            tokens
+            + [pad_id] * (
+                max_length - length
+            )
+        )
 
     return tokens, length
 
 
 # ============================================================
-# CRIAÇÃO DOS NPZS
+# NPZ WRITER
 # ============================================================
 
 class NPZWriter:
-    """
-    Acumula exemplos e grava NPZs em chunks.
-
-    Cada NPZ contém:
-
-        src_tokens  -> (N, MAX_SRC_LENGTH)
-        tgt_tokens  -> (N, MAX_TGT_LENGTH)
-        src_lengths -> (N,)
-        tgt_lengths -> (N,)
-    """
 
     def __init__(
         self,
@@ -173,9 +345,18 @@ class NPZWriter:
         chunk_size,
         src_length,
         tgt_length,
-        pad_id
+        pad_id,
     ):
-        self.output_dir = os.path.abspath(output_dir)
+
+        self.output_dir = os.path.abspath(
+            output_dir
+        )
+
+        self.meta_parts_dir = os.path.join(
+            self.output_dir,
+            "metadata_parts",
+        )
+
         self.split_name = split_name
         self.chunk_size = chunk_size
 
@@ -185,6 +366,7 @@ class NPZWriter:
 
         self.src_tokens = []
         self.tgt_tokens = []
+
         self.src_lengths = []
         self.tgt_lengths = []
 
@@ -192,357 +374,1281 @@ class NPZWriter:
 
         self.chunk_id = 0
 
-        os.makedirs(self.output_dir, exist_ok=True)
+        os.makedirs(
+            self.output_dir,
+            exist_ok=True,
+        )
+
+        os.makedirs(
+            self.meta_parts_dir,
+            exist_ok=True,
+        )
+
+        self._detect_existing_chunks()
+
+    # --------------------------------------------------------
+    # Detecta chunks já existentes
+    # --------------------------------------------------------
+
+    def _detect_existing_chunks(self):
+
+        chunk_ids = []
+
+        prefix = (
+            f"{self.split_name}_"
+        )
+
+        for filename in os.listdir(
+            self.output_dir
+        ):
+
+            if not filename.startswith(
+                prefix
+            ):
+                continue
+
+            if not filename.endswith(
+                ".npz"
+            ):
+                continue
+
+            number_part = filename[
+                len(prefix):-4
+            ]
+
+            try:
+
+                chunk_id = int(
+                    number_part
+                )
+
+                chunk_ids.append(
+                    chunk_id
+                )
+
+            except ValueError:
+                continue
+
+        if chunk_ids:
+
+            self.chunk_id = (
+                max(chunk_ids) + 1
+            )
+
+    # --------------------------------------------------------
+    # Add
+    # --------------------------------------------------------
 
     def add(
         self,
         dataset_id,
         index,
         src_tokens,
-        tgt_tokens
+        tgt_tokens,
     ):
 
-        npz_index = len(self.src_tokens)
-
-        src_padded, src_length = pad_tokens(
-            src_tokens,
-            self.src_length,
-            self.pad_id
+        npz_index = len(
+            self.src_tokens
         )
 
-        tgt_padded, tgt_length = pad_tokens(
-            tgt_tokens,
-            self.tgt_length,
-            self.pad_id
+        src_padded, src_length = (
+            pad_tokens(
+                src_tokens,
+                self.src_length,
+                self.pad_id,
+            )
         )
 
-        self.src_tokens.append(src_padded)
-        self.tgt_tokens.append(tgt_padded)
+        tgt_padded, tgt_length = (
+            pad_tokens(
+                tgt_tokens,
+                self.tgt_length,
+                self.pad_id,
+            )
+        )
 
-        self.src_lengths.append(src_length)
-        self.tgt_lengths.append(tgt_length)
+        self.src_tokens.append(
+            src_padded
+        )
+
+        self.tgt_tokens.append(
+            tgt_padded
+        )
+
+        self.src_lengths.append(
+            src_length
+        )
+
+        self.tgt_lengths.append(
+            tgt_length
+        )
 
         self.metadata.append(
             {
                 "dataset_id": dataset_id,
                 "index": int(index),
                 "split": self.split_name,
-                "npz_index": npz_index
+                "npz_index": npz_index,
             }
         )
 
-        if len(self.src_tokens) >= self.chunk_size:
+        if (
+            len(self.src_tokens)
+            >= self.chunk_size
+        ):
+
             return self.flush()
 
-        return []
+        return False
+
+    # --------------------------------------------------------
+    # Flush
+    # --------------------------------------------------------
 
     def flush(self):
 
         if not self.src_tokens:
-            return []
+            return False
 
-        filename = (
-            f"{self.split_name}_{self.chunk_id:05d}.npz"
+        chunk_id = self.chunk_id
+
+        base_name = (
+            f"{self.split_name}_"
+            f"{chunk_id:05d}"
+        )
+
+        npz_filename = (
+            base_name + ".npz"
+        )
+
+        meta_filename = (
+            base_name
+            + "_meta.parquet"
         )
 
         npz_path = os.path.abspath(
-            os.path.join(self.output_dir, filename)
-        )
-
-        np.savez(
-            npz_path,
-            src_tokens=np.asarray(
-                self.src_tokens,
-                dtype=np.int32
-            ),
-            tgt_tokens=np.asarray(
-                self.tgt_tokens,
-                dtype=np.int32
-            ),
-            src_lengths=np.asarray(
-                self.src_lengths,
-                dtype=np.int32
-            ),
-            tgt_lengths=np.asarray(
-                self.tgt_lengths,
-                dtype=np.int32
+            os.path.join(
+                self.output_dir,
+                npz_filename,
             )
         )
 
-        print(
-            f"\nSalvo: {npz_path}"
+        meta_path = os.path.abspath(
+            os.path.join(
+                self.meta_parts_dir,
+                meta_filename,
+            )
         )
 
-        print(
-            f"  exemplos: {len(self.src_tokens):,}".replace(",", ".")
+        # ----------------------------------------------------
+        # Arquivos temporários
+        # ----------------------------------------------------
+
+        npz_tmp = npz_path + ".tmp"
+        meta_tmp = meta_path + ".tmp"
+
+        # ----------------------------------------------------
+        # Segurança
+        # ----------------------------------------------------
+
+        if os.path.exists(npz_tmp):
+            os.remove(npz_tmp)
+
+        if os.path.exists(meta_tmp):
+            os.remove(meta_tmp)
+
+        # ----------------------------------------------------
+        # 1. Salva NPZ temporário
+        # ----------------------------------------------------
+
+        np.savez(
+            npz_tmp,
+            src_tokens=np.asarray(
+                self.src_tokens,
+                dtype=np.int32,
+            ),
+            tgt_tokens=np.asarray(
+                self.tgt_tokens,
+                dtype=np.int32,
+            ),
+            src_lengths=np.asarray(
+                self.src_lengths,
+                dtype=np.int32,
+            ),
+            tgt_lengths=np.asarray(
+                self.tgt_lengths,
+                dtype=np.int32,
+            ),
         )
 
-        print(
-            f"  src shape: "
-            f"({len(self.src_tokens)}, {self.src_length})"
-        )
+        # np.savez pode adicionar ".npz"
+        if os.path.exists(
+            npz_tmp + ".npz"
+        ):
 
-        print(
-            f"  tgt shape: "
-            f"({len(self.tgt_tokens)}, {self.tgt_length})"
-        )
+            os.replace(
+                npz_tmp + ".npz",
+                npz_tmp,
+            )
 
-        # Adiciona o caminho completo ao metadata
+        # ----------------------------------------------------
+        # Garante que NPZ terminou
+        # ----------------------------------------------------
+
+        if not os.path.exists(
+            npz_tmp
+        ):
+
+            raise RuntimeError(
+                f"NPZ temporário não foi criado: "
+                f"{npz_tmp}"
+            )
+
+        # ----------------------------------------------------
+        # 2. Metadata
+        # ----------------------------------------------------
+
         for row in self.metadata:
-            row["npz_path"] = npz_path
 
-        metadata = self.metadata
+            row["npz_path"] = (
+                npz_path
+            )
+
+        df_meta = pd.DataFrame(
+            self.metadata
+        )
+
+        df_meta = df_meta[
+            [
+                "dataset_id",
+                "index",
+                "split",
+                "npz_path",
+                "npz_index",
+            ]
+        ]
+
+        df_meta["dataset_id"] = (
+            df_meta["dataset_id"]
+            .astype(str)
+        )
+
+        df_meta["index"] = (
+            df_meta["index"]
+            .astype(np.int64)
+        )
+
+        df_meta["split"] = (
+            df_meta["split"]
+            .astype(str)
+        )
+
+        df_meta["npz_path"] = (
+            df_meta["npz_path"]
+            .astype(str)
+        )
+
+        df_meta["npz_index"] = (
+            df_meta["npz_index"]
+            .astype(np.int64)
+        )
+
+        table = pa.Table.from_pandas(
+            df_meta,
+            preserve_index=False,
+        )
+
+        pq.write_table(
+            table,
+            meta_tmp,
+            compression="zstd",
+        )
+
+        del df_meta
+        del table
+
+        # ----------------------------------------------------
+        # 3. Commit atômico
+        # ----------------------------------------------------
+
+        os.replace(
+            npz_tmp,
+            npz_path,
+        )
+
+        os.replace(
+            meta_tmp,
+            meta_path,
+        )
+
+        # ----------------------------------------------------
+        # 4. Limpa RAM
+        # ----------------------------------------------------
+
+        count = len(
+            self.src_tokens
+        )
 
         self.src_tokens = []
         self.tgt_tokens = []
+
         self.src_lengths = []
         self.tgt_lengths = []
+
         self.metadata = []
 
         self.chunk_id += 1
 
         gc.collect()
 
-        return metadata
+        print(
+            f"\n[{self.split_name}] "
+            f"Chunk {chunk_id:05d} concluído "
+            f"({count:,} exemplos)"
+        )
+
+        return True
+
+    # --------------------------------------------------------
+    # Close
+    # --------------------------------------------------------
 
     def close(self):
+
         return self.flush()
 
 
 # ============================================================
-# PROCESSAMENTO DO TSV
+# WORKER GLOBAL
 # ============================================================
 
-def process_split(
-    tsv_path,
-    split_name,
-    split_indices,
-    tokenizer,
-    output_dir,
-    max_src_length,
-    max_tgt_length,
-    chunk_size,
-    pad_id
+_WORKER_TOKENIZER = None
+
+
+# ============================================================
+# WORKER INIT
+# ============================================================
+
+def init_worker(
+    tokenizer_path,
 ):
+
+    global _WORKER_TOKENIZER
+
+    _WORKER_TOKENIZER = (
+        Tokenizer.from_file(
+            tokenizer_path
+        )
+    )
+
+
+# ============================================================
+# TOKENIZAÇÃO
+# ============================================================
+
+def tokenize_batch(rows):
     """
-    Lê o TSV uma única vez para o split solicitado,
-    tokeniza os exemplos e cria os NPZs.
+    rows:
 
-    Retorna uma lista de metadados para o novo Parquet.
+        (
+            split,
+            dataset_id,
+            index,
+            text1,
+            text2,
+        )
     """
 
-    print()
-    print("=" * 70)
-    print(f"PROCESSANDO SPLIT: {split_name}")
-    print("=" * 70)
-
-    total_expected = sum(
-        len(indices)
-        for indices in split_indices.values()
-    )
-
-    print(
-        f"Exemplos esperados: "
-        f"{total_expected:,}".replace(",", ".")
-    )
-
-    writer = NPZWriter(
-        output_dir=output_dir,
-        split_name=split_name,
-        chunk_size=chunk_size,
-        src_length=max_src_length,
-        tgt_length=max_tgt_length,
-        pad_id=pad_id
-    )
-
-    metadata = []
-
-    processed = 0
+    results = []
     skipped = 0
 
-    with open(tsv_path, "r", encoding="utf-8") as f:
+    for (
+        split_name,
+        dataset_id,
+        idx,
+        text1,
+        text2,
+    ) in rows:
 
-        # Cabeçalho
-        next(f)
+        # ----------------------------------------------------
+        # Direção
+        # ----------------------------------------------------
 
-        with tqdm(
-            total=total_expected,
-            desc=f"Tokenizando {split_name}",
-            unit="exemplos"
-        ) as pbar:
+        if dataset_id.endswith(
+            "_en_pt"
+        ):
 
-            for line in f:
+            text1 = (
+                f"<2pt> {text1}"
+            )
 
-                line = line.rstrip("\n")
+        elif dataset_id.endswith(
+            "_en_es"
+        ):
 
-                try:
-                    meta_part, texts_part = line.split(
-                        "<METADATA>",
-                        1
-                    )
+            text1 = (
+                f"<2es> {text1}"
+            )
 
-                    dataset_id, idx_str = meta_part.split(
-                        "<SEP>",
-                        1
-                    )
+        # ----------------------------------------------------
+        # Tokenização
+        # ----------------------------------------------------
 
-                    text1, text2 = texts_part.split(
-                        "<SEP>",
-                        1
-                    )
+        try:
 
-                    idx = int(idx_str)
+            src_encoded = (
+                _WORKER_TOKENIZER.encode(
+                    text1
+                )
+            )
 
-                except ValueError:
-                    skipped += 1
-                    continue
-
-                dataset_set = split_indices.get(dataset_id)
-
-                if dataset_set is None:
-                    continue
-
-                if idx not in dataset_set:
-                    continue
-
-                # ------------------------------------------------
-                # TAG DE DIREÇÃO
-                # ------------------------------------------------
-
-                if dataset_id.endswith("_en_pt"):
-                    text1 = f"<2pt> {text1}"
-
-                elif dataset_id.endswith("_en_es"):
-                    text1 = f"<2es> {text1}"
-
-                # ------------------------------------------------
-                # TOKENIZAÇÃO
-                # ------------------------------------------------
-
-                encoded = tokenizer.encode(
-                    text1,
+            tgt_encoded = (
+                _WORKER_TOKENIZER.encode(
                     text2
                 )
+            )
 
-                ids = encoded.ids
+        except Exception:
 
-                # ------------------------------------------------
-                # IMPORTANTE:
-                #
-                # O tokenizer está configurado com:
-                #
-                # <BOS> $A <SEP> $B <EOS>
-                #
-                # Portanto precisamos separar src/tgt.
-                #
-                # Para preservar exatamente source/target,
-                # tokenizamos individualmente.
-                # ------------------------------------------------
+            skipped += 1
+            continue
 
-                src_encoded = tokenizer.encode(text1)
-                tgt_encoded = tokenizer.encode(text2)
-
-                src_ids = src_encoded.ids
-                tgt_ids = tgt_encoded.ids
-
-                rows = writer.add(
-                    dataset_id=dataset_id,
-                    index=idx,
-                    src_tokens=src_ids,
-                    tgt_tokens=tgt_ids
-                )
-
-                if rows:
-                    metadata.extend(rows)
-
-                processed += 1
-                pbar.update(1)
-
-    rows = writer.close()
-
-    if rows:
-        metadata.extend(rows)
-
-    print()
-    print(f"Processados: {processed:,}".replace(",", "."))
-    print(f"Ignorados/malformados: {skipped:,}".replace(",", "."))
-
-    return metadata
-
-
-# ============================================================
-# SALVA NOVO PARQUET
-# ============================================================
-
-def save_split_parquet(metadata, output_path):
-
-    print()
-    print("Salvando novo dataset de split...")
-
-    if not metadata:
-        raise RuntimeError(
-            "Nenhum exemplo foi produzido."
+        results.append(
+            (
+                split_name,
+                dataset_id,
+                idx,
+                src_encoded.ids,
+                tgt_encoded.ids,
+            )
         )
 
-    df = pd.DataFrame(metadata)
+    return (
+        results,
+        skipped,
+    )
 
-    # Ordenação útil para leitura posterior
-    df = df[
-        [
+
+# ============================================================
+# PARSE TSV
+# ============================================================
+
+def parse_tsv_line(line):
+
+    line = line.rstrip("\n")
+
+    try:
+
+        meta_part, texts_part = (
+            line.split(
+                "<METADATA>",
+                1,
+            )
+        )
+
+        dataset_id, idx_str = (
+            meta_part.split(
+                "<SEP>",
+                1,
+            )
+        )
+
+        text1, text2 = (
+            texts_part.split(
+                "<SEP>",
+                1,
+            )
+        )
+
+        idx = int(idx_str)
+
+    except ValueError:
+
+        return None
+
+    return (
+        dataset_id,
+        idx,
+        text1,
+        text2,
+    )
+
+
+# ============================================================
+# LEITURA DO PARQUET
+# ============================================================
+
+def iter_parquet_batches(
+    parquet_path,
+    start_row,
+):
+
+    parquet_file = pq.ParquetFile(
+        parquet_path
+    )
+
+    total_rows = (
+        parquet_file.metadata.num_rows
+    )
+
+    if start_row >= total_rows:
+
+        return
+
+    # --------------------------------------------------------
+    # Para retomar do checkpoint sem carregar tudo
+    # --------------------------------------------------------
+
+    rows_to_skip = start_row
+
+    for batch in parquet_file.iter_batches(
+        batch_size=PARQUET_BATCH_SIZE,
+        columns=[
             "dataset_id",
             "index",
             "split",
-            "npz_path",
-            "npz_index"
+        ],
+    ):
+
+        if rows_to_skip > 0:
+
+            if (
+                rows_to_skip
+                >= batch.num_rows
+            ):
+
+                rows_to_skip -= (
+                    batch.num_rows
+                )
+
+                continue
+
+            # --------------------------------------------
+            # Estamos dentro deste batch
+            # --------------------------------------------
+
+            batch = batch.slice(
+                rows_to_skip
+            )
+
+            rows_to_skip = 0
+
+        df = batch.to_pandas()
+
+        yield df
+
+        del df
+
+
+# ============================================================
+# PROCESSAMENTO
+# ============================================================
+
+def process_dataset(
+    tsv_path,
+    parquet_path,
+    output_dir,
+    tokenizer_path,
+    pad_id,
+    parquet_rows
+):
+
+    checkpoint = (
+        load_checkpoint()
+    )
+
+    start_row = int(
+        checkpoint[
+            "tsv_rows_consumed"
         ]
-    ]
-
-    # Garante tipos consistentes
-    df["dataset_id"] = df["dataset_id"].astype(str)
-    df["index"] = df["index"].astype(np.int64)
-    df["split"] = df["split"].astype(str)
-    df["npz_path"] = df["npz_path"].astype(str)
-    df["npz_index"] = df["npz_index"].astype(np.int64)
-
-    os.makedirs(
-        os.path.dirname(os.path.abspath(output_path)),
-        exist_ok=True
     )
 
-    table = pa.Table.from_pandas(
-        df,
-        preserve_index=False
+    processed_examples = int(
+        checkpoint[
+            "processed_examples"
+        ]
     )
-
-    pq.write_table(
-        table,
-        output_path,
-        compression="zstd"
-    )
-
-    print(f"Parquet salvo em:")
-    print(f"  {os.path.abspath(output_path)}")
 
     print()
-    print("Colunas:")
-    for column in df.columns:
-        print(f"  - {column}")
+    print("=" * 70)
+    print("RETOMADA")
+    print("=" * 70)
+
+    print(
+        f"Linhas já consumidas: "
+        f"{start_row:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+    print(
+        f"Exemplos já processados: "
+        f"{processed_examples:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+    # --------------------------------------------------------
+    # Writers
+    # --------------------------------------------------------
+
+    writers = {
+        "train": NPZWriter(
+            output_dir,
+            "train",
+            NPZ_CHUNK_SIZE,
+            MAX_SRC_LENGTH,
+            MAX_TGT_LENGTH,
+            pad_id,
+        ),
+
+        "val": NPZWriter(
+            output_dir,
+            "val",
+            NPZ_CHUNK_SIZE,
+            MAX_SRC_LENGTH,
+            MAX_TGT_LENGTH,
+            pad_id,
+        ),
+
+        "test": NPZWriter(
+            output_dir,
+            "test",
+            NPZ_CHUNK_SIZE,
+            MAX_SRC_LENGTH,
+            MAX_TGT_LENGTH,
+            pad_id,
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Workers
+    # --------------------------------------------------------
+
+    workers = min(
+        MAX_WORKERS,
+        os.cpu_count() or 1,
+    )
+
+    print(
+        f"Workers: {workers}"
+    )
+
+    mp_context = mp.get_context(
+        "fork"
+    )
+
+    pending = set()
+
+    # --------------------------------------------------------
+    # Abre TSV
+    # --------------------------------------------------------
+
+    with open(
+        tsv_path,
+        "r",
+        encoding="utf-8",
+    ) as tsv:
+
+        # --------------------------------------------
+        # Cabeçalho
+        # --------------------------------------------
+
+        next(tsv)
+
+        # --------------------------------------------
+        # Avança TSV até checkpoint
+        # --------------------------------------------
+
+        if start_row > 0:
+
+            print(
+                "Avançando TSV até "
+                "o checkpoint..."
+            )
+
+            skipped_lines = 0
+
+            with tqdm(
+                total=start_row,
+                initial=0,
+                desc="Recuperando posição",
+                unit="linha",
+            ) as pbar:
+
+                while (
+                    skipped_lines
+                    < start_row
+                ):
+
+                    line = tsv.readline()
+
+                    if not line:
+
+                        raise RuntimeError(
+                            "O TSV terminou antes "
+                            "do ponto salvo no checkpoint."
+                        )
+
+                    skipped_lines += 1
+
+                    if (
+                        skipped_lines % 10_000
+                        == 0
+                    ):
+
+                        pbar.update(
+                            10_000
+                        )
+
+                remaining = (
+                    skipped_lines
+                    % 10_000
+                )
+
+                if remaining:
+                    pbar.update(
+                        remaining
+                    )
+
+    # ========================================================
+    # REABRE TSV
+    # ========================================================
+
+    with open(
+        tsv_path,
+        "r",
+        encoding="utf-8",
+    ) as tsv:
+
+        next(tsv)
+
+        # --------------------------------------------
+        # Posiciona novamente
+        # --------------------------------------------
+
+        for _ in range(
+            start_row
+        ):
+
+            next(tsv)
+
+        # --------------------------------------------
+        # Executor
+        # --------------------------------------------
+
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=mp_context,
+            initializer=init_worker,
+            initargs=(
+                tokenizer_path,
+            ),
+        ) as executor:
+
+            parquet_batches = (
+                iter_parquet_batches(
+                    parquet_path,
+                    start_row,
+                )
+            )
+
+            current_row = start_row
+
+            # ====================================================
+            # LOOP PRINCIPAL
+            # ====================================================
+
+            num_batches = math.ceil(
+                parquet_rows / PARQUET_BATCH_SIZE
+            )
+
+            start_batch = start_row // PARQUET_BATCH_SIZE
+
+            for parquet_df in tqdm(
+                parquet_batches,
+                desc="Processando",
+                unit="batch",
+                total=num_batches,
+                initial=start_batch,
+            ):
+
+                batch_rows = []
+
+                # ------------------------------------------------
+                # Lê TSV exatamente na mesma quantidade de linhas
+                # ------------------------------------------------
+
+                for row in parquet_df.itertuples(
+                    index=False
+                ):
+
+                    line = tsv.readline()
+
+                    if not line:
+
+                        raise RuntimeError(
+                            "TSV terminou antes "
+                            "do Parquet."
+                        )
+
+                    current_row += 1
+
+                    parsed = (
+                        parse_tsv_line(
+                            line
+                        )
+                    )
+
+                    if parsed is None:
+
+                        raise RuntimeError(
+                            "Linha malformada no TSV "
+                            f"na posição {current_row}."
+                        )
+
+                    (
+                        dataset_id_tsv,
+                        index_tsv,
+                        text1,
+                        text2,
+                    ) = parsed
+
+                    # --------------------------------------------
+                    # VERIFICAÇÃO CRÍTICA
+                    # --------------------------------------------
+
+                    if (
+                        dataset_id_tsv
+                        != row.dataset_id
+                        or int(index_tsv)
+                        != int(row.index)
+                    ):
+
+                        raise RuntimeError(
+                            "\n\n"
+                            "ERRO DE ORDEM!\n"
+                            "O Parquet e o TSV não estão "
+                            "na mesma ordem.\n\n"
+                            f"TSV:\n"
+                            f"  dataset_id = "
+                            f"{dataset_id_tsv}\n"
+                            f"  index      = "
+                            f"{index_tsv}\n\n"
+                            f"Parquet:\n"
+                            f"  dataset_id = "
+                            f"{row.dataset_id}\n"
+                            f"  index      = "
+                            f"{row.index}\n\n"
+                            f"Posição: "
+                            f"{current_row}\n\n"
+                            "O processamento foi interrompido "
+                            "para evitar gerar dados incorretos."
+                        )
+
+                    batch_rows.append(
+                        (
+                            row.split,
+                            dataset_id_tsv,
+                            index_tsv,
+                            text1,
+                            text2,
+                        )
+                    )
+
+                del parquet_df
+
+                # ------------------------------------------------
+                # Envia batch ao worker
+                # ------------------------------------------------
+
+                if batch_rows:
+
+                    future = (
+                        executor.submit(
+                            tokenize_batch,
+                            batch_rows,
+                        )
+                    )
+
+                    pending.add(
+                        future
+                    )
+
+                    del batch_rows
+
+                # ------------------------------------------------
+                # Limita memória
+                # ------------------------------------------------
+
+                if (
+                    len(pending)
+                    >= MAX_PENDING
+                ):
+
+                    done, pending = wait(
+                        pending,
+                        return_when=FIRST_COMPLETED,
+                    )
+
+                    # --------------------------------------------
+                    # Consome resultados
+                    # --------------------------------------------
+
+                    for future in done:
+
+                        results, skipped = (
+                            future.result()
+                        )
+
+                        # ----------------------------------------
+                        # Salva tokens
+                        # ----------------------------------------
+
+                        for (
+                            split_name,
+                            dataset_id,
+                            idx,
+                            src_tokens,
+                            tgt_tokens,
+                        ) in results:
+
+                            writers[
+                                split_name
+                            ].add(
+                                dataset_id,
+                                idx,
+                                src_tokens,
+                                tgt_tokens,
+                            )
+
+                        processed_examples += (
+                            len(results)
+                        )
+
+                        del results
+
+                        # ----------------------------------------
+                        # IMPORTANTE:
+                        #
+                        # checkpoint só deve avançar depois
+                        # que os dados foram efetivamente gravados.
+                        # ----------------------------------------
+
+                    save_checkpoint(
+                        tsv_rows_consumed=current_row,
+                        processed_examples=processed_examples,
+                        writers=writers,
+                    )
+
+                    gc.collect()
+
+            # ====================================================
+            # FINALIZA WORKERS
+            # ====================================================
+
+            while pending:
+
+                done, pending = wait(
+                    pending,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for future in done:
+
+                    results, skipped = (
+                        future.result()
+                    )
+
+                    for (
+                        split_name,
+                        dataset_id,
+                        idx,
+                        src_tokens,
+                        tgt_tokens,
+                    ) in results:
+
+                        writers[
+                            split_name
+                        ].add(
+                            dataset_id,
+                            idx,
+                            src_tokens,
+                            tgt_tokens,
+                        )
+
+                    processed_examples += (
+                        len(results)
+                    )
+
+                    del results
+
+                save_checkpoint(
+                    tsv_rows_consumed=current_row,
+                    processed_examples=processed_examples,
+                    writers=writers,
+                )
+
+    # ========================================================
+    # FLUSH FINAL
+    # ========================================================
+
+    for writer in writers.values():
+
+        writer.flush()
+
+    # --------------------------------------------------------
+    # Checkpoint final
+    # --------------------------------------------------------
+
+    save_checkpoint(
+        tsv_rows_consumed=current_row,
+        processed_examples=processed_examples,
+        writers=writers,
+    )
+
+    print()
+    print("=" * 70)
+    print("TOKENIZAÇÃO FINALIZADA")
+    print("=" * 70)
+
+    print(
+        f"Linhas consumidas: "
+        f"{current_row:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+    print(
+        f"Exemplos processados: "
+        f"{processed_examples:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+
+# ============================================================
+# CONSOLIDA METADADOS
+# ============================================================
+
+def consolidate_metadata(
+    metadata_parts_dir,
+    output_path,
+):
+
+    print()
+    print("=" * 70)
+    print("CONSOLIDANDO METADADOS")
+    print("=" * 70)
+
+    meta_files = sorted(
+        os.path.join(
+            metadata_parts_dir,
+            filename,
+        )
+        for filename in os.listdir(
+            metadata_parts_dir
+        )
+        if filename.endswith(
+            "_meta.parquet"
+        )
+        and not filename.endswith(
+            ".tmp"
+        )
+    )
+
+    if not meta_files:
+
+        raise RuntimeError(
+            "Nenhum metadata Parquet encontrado."
+        )
+
+    print(
+        f"Arquivos encontrados: "
+        f"{len(meta_files):,}"
+    )
+
+    writer = None
+
+    try:
+
+        for meta_path in tqdm(
+            meta_files,
+            desc="Consolidando metadata",
+            unit="arquivo",
+        ):
+
+            table = pq.read_table(
+                meta_path
+            )
+
+            if writer is None:
+
+                writer = pq.ParquetWriter(
+                    output_path,
+                    table.schema,
+                    compression="zstd",
+                )
+
+            writer.write_table(
+                table
+            )
+
+            del table
+
+    finally:
+
+        if writer is not None:
+            writer.close()
 
     print()
     print(
-        f"Total de exemplos: "
-        f"{len(df):,}".replace(",", ".")
+        f"Metadata final:\n"
+        f"  {os.path.abspath(output_path)}"
     )
 
-    print("\nDistribuição por split:")
+
+# ============================================================
+# LIMPEZA DE TEMPORÁRIOS
+# ============================================================
+
+def cleanup_temp_files(
+    output_dir,
+):
+
+    removed = 0
+
+    # --------------------------------------------------------
+    # NPZ temporários
+    # --------------------------------------------------------
+
+    for root, dirs, files in os.walk(
+        output_dir
+    ):
+
+        for filename in files:
+
+            if (
+                filename.endswith(
+                    ".npz.tmp"
+                )
+                or filename.endswith(
+                    ".parquet.tmp"
+                )
+                or filename.endswith(
+                    ".json.tmp"
+                )
+            ):
+
+                path = os.path.join(
+                    root,
+                    filename,
+                )
+
+                try:
+
+                    os.remove(
+                        path
+                    )
+
+                    removed += 1
+
+                except OSError:
+                    pass
+
+    if removed:
+
+        print(
+            f"Temporários removidos: "
+            f"{removed}"
+        )
+
+
+# ============================================================
+# VERIFICAÇÃO DOS CHUNKS
+# ============================================================
+
+def verify_chunks(
+    output_dir,
+    metadata_parts_dir,
+):
+
+    print()
+    print(
+        "Verificando chunks..."
+    )
+
+    problems = []
+
+    for filename in os.listdir(
+        metadata_parts_dir
+    ):
+
+        if not filename.endswith(
+            "_meta.parquet"
+        ):
+
+            continue
+
+        base = filename[
+            :-len("_meta.parquet")
+        ]
+
+        npz_path = os.path.join(
+            output_dir,
+            base + ".npz",
+        )
+
+        meta_path = os.path.join(
+            metadata_parts_dir,
+            filename,
+        )
+
+        if not os.path.exists(
+            npz_path
+        ):
+
+            problems.append(
+                (
+                    filename,
+                    "NPZ ausente",
+                )
+            )
+
+        if not os.path.exists(
+            meta_path
+        ):
+
+            problems.append(
+                (
+                    filename,
+                    "metadata ausente",
+                )
+            )
+
+    if problems:
+
+        print(
+            "\nPROBLEMAS ENCONTRADOS:"
+        )
+
+        for filename, reason in problems:
+
+            print(
+                f"  {filename}: {reason}"
+            )
+
+        raise RuntimeError(
+            "Existem chunks incompletos."
+        )
 
     print(
-        df["split"]
-        .value_counts()
-        .to_string()
+        "Todos os chunks estão completos."
     )
-
-    return df
 
 
 # ============================================================
@@ -552,94 +1658,167 @@ def save_split_parquet(metadata, output_path):
 if __name__ == "__main__":
 
     print("=" * 70)
-    print("TOKENIZAÇÃO + NPZ + NOVO DATASET DE SPLIT")
+    print(
+        "TOKENIZAÇÃO STREAMING"
+    )
+    print(
+        "SEM SPLIT_INDICES EM RAM"
+    )
     print("=" * 70)
 
+    # --------------------------------------------------------
+    # Diretórios
+    # --------------------------------------------------------
+
     os.makedirs(
-        os.path.abspath(OUTPUT_DIR),
-        exist_ok=True
+        OUTPUT_DIR,
+        exist_ok=True,
+    )
+
+    os.makedirs(
+        os.path.join(
+            OUTPUT_DIR,
+            "metadata_parts",
+        ),
+        exist_ok=True,
     )
 
     # --------------------------------------------------------
-    # 1. Carrega tokenizer
+    # Remove temporários de execução anterior
     # --------------------------------------------------------
 
-    print("\nCarregando tokenizer...")
+    cleanup_temp_files(
+        OUTPUT_DIR
+    )
+
+    # --------------------------------------------------------
+    # Verifica configuração
+    # --------------------------------------------------------
+
+    verify_processing_config()
+
+    # --------------------------------------------------------
+    # Tokenizer
+    # --------------------------------------------------------
+
+    print(
+        "\nCarregando tokenizer..."
+    )
 
     tokenizer = Tokenizer.from_file(
         TOKENIZER_PATH
     )
 
-    pad_id = tokenizer.token_to_id("<PAD>")
+    pad_id = tokenizer.token_to_id(
+        "<PAD>"
+    )
 
     if pad_id is None:
+
         raise RuntimeError(
-            "O tokenizer não possui o token <PAD>."
+            "O tokenizer não possui "
+            "o token <PAD>."
         )
 
-    print(f"Tokenizer: {TOKENIZER_PATH}")
-    print(f"PAD ID: {pad_id}")
-    print(f"MAX_SRC_LENGTH: {MAX_SRC_LENGTH}")
-    print(f"MAX_TGT_LENGTH: {MAX_TGT_LENGTH}")
-    print(f"NPZ_CHUNK_SIZE: {NPZ_CHUNK_SIZE:,}".replace(",", "."))
+    print(
+        f"Tokenizer: "
+        f"{TOKENIZER_PATH}"
+    )
 
-    # --------------------------------------------------------
-    # 2. Carrega split original
-    # --------------------------------------------------------
+    print(
+        f"PAD ID: {pad_id}"
+    )
 
-    split_indices = load_split_indices(
-        SPLIT_PARQUET_PATH,
-        batch_size=PARQUET_BATCH_SIZE
+    print(
+        f"MAX_SRC_LENGTH: "
+        f"{MAX_SRC_LENGTH}"
+    )
+
+    print(
+        f"MAX_TGT_LENGTH: "
+        f"{MAX_TGT_LENGTH}"
+    )
+
+    print(
+        f"NPZ_CHUNK_SIZE: "
+        f"{NPZ_CHUNK_SIZE:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+    print(
+        f"PARQUET_BATCH_SIZE: "
+        f"{PARQUET_BATCH_SIZE:,}".replace(
+            ",",
+            ".",
+        )
+    )
+
+    print(
+        f"MAX_WORKERS: "
+        f"{MAX_WORKERS}"
     )
 
     # --------------------------------------------------------
-    # 3. Processa todos os splits
+    # Verifica Parquet
     # --------------------------------------------------------
 
-    all_metadata = []
+    parquet_file = pq.ParquetFile(
+        SPLIT_PARQUET_PATH
+    )
 
-    for split_name in ["train", "valid", "test"]:
+    parquet_rows = (
+        parquet_file.metadata.num_rows
+    )
 
-        current_indices = split_indices.get(
-            split_name,
-            {}
+    print()
+    print(
+        f"Linhas no Parquet: "
+        f"{parquet_rows:,}".replace(
+            ",",
+            ".",
         )
-
-        if not current_indices:
-            print(
-                f"\nNenhum exemplo encontrado para "
-                f"'{split_name}'. Pulando."
-            )
-            continue
-
-        metadata = process_split(
-            tsv_path=TSV_PATH,
-            split_name=split_name,
-            split_indices=current_indices,
-            tokenizer=tokenizer,
-            output_dir=OUTPUT_DIR,
-            max_src_length=MAX_SRC_LENGTH,
-            max_tgt_length=MAX_TGT_LENGTH,
-            chunk_size=NPZ_CHUNK_SIZE,
-            pad_id=pad_id
-        )
-
-        all_metadata.extend(metadata)
-
-        del metadata
-        gc.collect()
-
-    # --------------------------------------------------------
-    # 4. Novo Parquet
-    # --------------------------------------------------------
-
-    save_split_parquet(
-        metadata=all_metadata,
-        output_path=OUTPUT_SPLIT_PARQUET
     )
 
     # --------------------------------------------------------
-    # 5. Final
+    # Processa
+    # --------------------------------------------------------
+
+    process_dataset(
+        tsv_path=TSV_PATH,
+        parquet_path=SPLIT_PARQUET_PATH,
+        output_dir=OUTPUT_DIR,
+        tokenizer_path=TOKENIZER_PATH,
+        pad_id=pad_id,
+        parquet_rows=parquet_rows
+    )
+
+    # --------------------------------------------------------
+    # Verifica chunks
+    # --------------------------------------------------------
+
+    metadata_parts_dir = os.path.join(
+        OUTPUT_DIR,
+        "metadata_parts",
+    )
+
+    verify_chunks(
+        OUTPUT_DIR,
+        metadata_parts_dir,
+    )
+
+    # --------------------------------------------------------
+    # Consolida
+    # --------------------------------------------------------
+
+    consolidate_metadata(
+        metadata_parts_dir,
+        OUTPUT_SPLIT_PARQUET,
+    )
+
+    # --------------------------------------------------------
+    # Final
     # --------------------------------------------------------
 
     print()
@@ -647,23 +1826,26 @@ if __name__ == "__main__":
     print("PROCESSAMENTO CONCLUÍDO")
     print("=" * 70)
 
-    print(f"\nNPZs:")
-    print(f"  {os.path.abspath(OUTPUT_DIR)}")
-
-    print(f"\nNovo split:")
-    print(f"  {os.path.abspath(OUTPUT_SPLIT_PARQUET)}")
+    print()
+    print("NPZs:")
+    print(
+        os.path.abspath(
+            OUTPUT_DIR
+        )
+    )
 
     print()
-    print("Estrutura dos NPZs:")
-    print("  src_tokens  -> tokens source já padded")
-    print("  tgt_tokens  -> tokens target já padded")
-    print("  src_lengths -> comprimento real da source")
-    print("  tgt_lengths -> comprimento real do target")
+    print("Metadata:")
+    print(
+        os.path.abspath(
+            OUTPUT_SPLIT_PARQUET
+        )
+    )
 
     print()
-    print("Estrutura do Parquet:")
-    print("  dataset_id")
-    print("  index")
-    print("  split")
-    print("  npz_path")
-    print("  npz_index")
+    print("Checkpoint:")
+    print(
+        os.path.abspath(
+            CHECKPOINT_PATH
+        )
+    )

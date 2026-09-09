@@ -1,0 +1,78 @@
+{
+    "tokenized_dir": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized",
+    "tokenizer_path": "artifacts/tokenizer_en_pt_es_60000.json",
+    "invert_src": false,
+    "architecture": "transformer",
+    "embedding_dim": 512,
+    "encoder_hidden_dim": 512,
+    "decoder_hidden_dim": 512,
+    "encoder_num_layers": 2,
+    "decoder_num_layers": 2,
+    "encoder_num_heads": 4,
+    "decoder_num_heads": 4,
+    "encoder_dropout": 0.0,
+    "decoder_dropout": 0.0,
+    "encoder_bidirectional": false,
+    "batch_size": 16,
+    "num_workers": 8,
+    "metadata_shuffle_buffer": 1000,
+    "npz_cache_size": 3,
+    "seed": 42,
+    "curriculum_levels": [
+        {
+            "max_len": 30,
+            "batch_size": 128,
+            "accum_steps": 1,
+            "max_step": 10000
+        },
+        {
+            "max_len": 64,
+            "batch_size": 128,
+            "accum_steps": 1,
+            "max_step": 25000
+        },
+        {
+            "max_len": 128,
+            "batch_size": 64,
+            "accum_steps": 2,
+            "max_step": 50000
+        },
+        {
+            "max_len": 256,
+            "batch_size": 32,
+            "accum_steps": 4,
+            "max_step": 60000
+        },
+        {
+            "max_len": 512,
+            "batch_size": 16,
+            "accum_steps": 4,
+            "max_step": 100000
+        }
+    ],
+    "accum_steps": 4,
+    "log_steps": 250,
+    "save_steps": 500,
+    "eval_steps": 1000,
+    "device": "cuda",
+    "desc": "Treinando em um dataset maior",
+    "name": "v70",
+    "early_stop_patience": 100,
+    "early_stop_min_delta": 0.0,
+    "warmup_steps": 1000,
+    "max_steps": 100000,
+    "learning_rate": 0.0001,
+    "vocab_size": 120000,
+    "max_len": 512,
+    "clip_grad": null,
+    "init_weight_method": null,
+    "init_bias_method": null,
+    "teacher_forcing": true,
+    "scheduler_sampling": true,
+    "teacher_forcing_ratio": 1.0,
+    "max_steps_scheduler_sampling": 500000,
+    "attention": true,
+    "label_smoothing": 0.0,
+    "separate_embedding": false,
+    "streaming_metadata": true
+}

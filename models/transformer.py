@@ -437,7 +437,8 @@ class Transformer(nn.Module):
             eos_token_id: int = 6,
             max_len: int = 128,
             kv_cache = False,
-            reset_cache: bool = False
+            reset_cache: bool = False,
+            input_decoder: torch.Tensor = None
     ):
         self.eval()
         
@@ -449,7 +450,8 @@ class Transformer(nn.Module):
             memory = self.encode(src)
             batch_size = src.size(0)
             device = src.device
-            input_decoder = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
+            if input_decoder is None:
+                input_decoder = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
             # positional encoding buffer is stored in self.positional_encoding.pe
@@ -457,7 +459,7 @@ class Transformer(nn.Module):
 
             seq_len = 1
 
-            outputs = [[bos_token_id] for _ in range(batch_size)]
+            outputs = [input_decoder for _ in range(batch_size)]
 
             for _ in range(max_len):
 

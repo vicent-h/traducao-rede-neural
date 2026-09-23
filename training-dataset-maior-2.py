@@ -3,7 +3,7 @@ from datetime import datetime
 import glob
 import json
 import logging
-import multiprocessing as mp
+import math
 import os
 from typing import List, Tuple
 
@@ -24,86 +24,42 @@ from utils.warmup import WarmupScheduler
 
 logger = logging.getLogger(__name__)
 
+MAX_TRAIN_OBSERVATIONS = None      # None = usa todo o train
+MAX_VAL_OBSERVATIONS = 25_000      # Ex.: limita validação a 50 mil
 
-def discover_metadata_files(tokenized_dir: str, split_name: str) -> list[str]:
-    """Descobre os arquivos de metadata do split sem carregar os registros em RAM."""
-    base_dir = os.path.abspath(tokenized_dir)
-    meta_dir = os.path.join(base_dir, "metadata_parts")
 
-    if not os.path.isdir(meta_dir):
-        raise FileNotFoundError(f"Diretório de metadata não encontrado: {meta_dir}")
+def resolve_metadata_path(tokenized_dir: str, metadata_path: str | None = None) -> str:
+    """
+    Resolve o único arquivo de metadata consolidado.
 
-    parquet_files = sorted(glob.glob(os.path.join(meta_dir, "*_meta.parquet")))
-    if not parquet_files:
-        raise FileNotFoundError(f"Nenhum _meta.parquet encontrado em: {meta_dir}")
+    Por padrão usa:
+        <tokenized_dir>/analise_textos_tokenized_split.parquet
 
-    split_name = split_name.lower()
-    valid_files = []
-
-    # O filtro do split é feito por arquivo. Não mantemos nenhum DataFrame
-    # consolidado em memória.
-    for parquet_file in parquet_files:
-        try:
-            columns = pd.read_parquet(parquet_file, columns=["split"])
-            if not columns.empty and columns["split"].astype(str).str.lower().eq(split_name).any():
-                valid_files.append(parquet_file)
-        except Exception:
-            logger.warning("Falha ao inspecionar %s; ignorando arquivo.", parquet_file)
-
-    if not valid_files:
-        raise ValueError(
-            f"Nenhum registro encontrado para split '{split_name}' em {meta_dir}"
+    Também aceita --metadata_path explícito.
+    """
+    if metadata_path:
+        path = os.path.abspath(metadata_path)
+    else:
+        path = os.path.join(
+            os.path.abspath(tokenized_dir),
+            "analise_textos_tokenized_split.parquet",
         )
 
-    return valid_files
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Metadata consolidado não encontrado: {path}"
+        )
 
+    return path
 
-class NPZCache:
-    """Cache LRU simples para arquivos .npz."""
-
-    def __init__(self, cache_size: int = 3):
-        self.cache_size = max(1, int(cache_size))
-        self.cache = {}
-        self.cache_order = []
-
-    def get(self, npz_path: str):
-        if npz_path in self.cache:
-            # Move para o fim: mais recentemente usado.
-            self.cache_order.remove(npz_path)
-            self.cache_order.append(npz_path)
-            return self.cache[npz_path]
-
-        chunk = np.load(npz_path, allow_pickle=False)
-        self.cache[npz_path] = chunk
-        self.cache_order.append(npz_path)
-
-        while len(self.cache_order) > self.cache_size:
-            old_path = self.cache_order.pop(0)
-            old_chunk = self.cache.pop(old_path, None)
-            if old_chunk is not None:
-                try:
-                    old_chunk.close()
-                except Exception:
-                    pass
-
-        return chunk
-
-    def close(self):
-        for chunk in self.cache.values():
-            try:
-                chunk.close()
-            except Exception:
-                pass
-        self.cache.clear()
-        self.cache_order.clear()
 
 
 class CurriculumLengthSampler(torch.utils.data.Sampler):
     """
     Curriculum por comprimento sem materializar índices em RAM.
 
-    O nível atual fica em multiprocessing.Value para que os workers do
-    DataLoader enxerguem as mudanças feitas pelo processo principal.
+    Como o treinamento agora usa num_workers=0, o estado do curriculum fica
+    diretamente no processo principal.
     """
 
     def __init__(self, curriculum_levels):
@@ -112,11 +68,11 @@ class CurriculumLengthSampler(torch.utils.data.Sampler):
 
         self.curriculum_levels = curriculum_levels
         self.step_count = 0
-        self._level_index = mp.Value("i", 0)
+        self._level_index = 0
 
     @property
     def level_index(self):
-        return self._level_index.value
+        return self._level_index
 
     @property
     def level_actual(self):
@@ -133,7 +89,7 @@ class CurriculumLengthSampler(torch.utils.data.Sampler):
             and current_index < len(self.curriculum_levels) - 1
         ):
             new_index = current_index + 1
-            self._level_index.value = new_index
+            self._level_index = new_index
 
             new_level = self.curriculum_levels[new_index]
 
@@ -237,312 +193,309 @@ class DynamicCollator:
         return torch.stack(srcs), torch.stack(tgts)
 
 
-class NPZCache:
-    """Cache LRU de arquivos .npz por worker."""
 
-    def __init__(self, cache_size: int = 3):
+class FixedShardCache:
+    """
+    Cache LRU de shards binários fixos.
+
+    Formato dos shards gerados pelo tokenizador:
+        [256 int32 SRC][256 int32 TGT][int32 src_length][int32 tgt_length]
+
+    Cada registro ocupa 2056 bytes.
+    O metadata informa src_length/tgt_length, e somente os tokens reais
+    são devolvidos ao Dataset.
+    """
+
+    MAX_SRC_LENGTH = 512
+    MAX_TGT_LENGTH = 512
+    DTYPE = np.dtype("<i4")
+    RECORD_INTS = MAX_SRC_LENGTH + MAX_TGT_LENGTH + 2
+    RECORD_BYTES = RECORD_INTS * DTYPE.itemsize
+
+    def __init__(self, cache_size=5):
         self.cache_size = max(1, int(cache_size))
         self.cache = {}
         self.cache_order = []
 
-    def get(self, npz_path: str):
-        if npz_path in self.cache:
-            self.cache_order.remove(npz_path)
-            self.cache_order.append(npz_path)
-            return self.cache[npz_path]
+    def _resolve_path(self, shard_path, metadata_path=None):
+        path = os.path.abspath(os.path.expanduser(str(shard_path)))
 
-        chunk = np.load(npz_path, allow_pickle=False)
-        self.cache[npz_path] = chunk
-        self.cache_order.append(npz_path)
+        if os.path.isfile(path):
+            return path
+
+        if metadata_path:
+            candidate = os.path.abspath(
+                os.path.join(
+                    os.path.dirname(os.path.abspath(metadata_path)),
+                    str(shard_path),
+                )
+            )
+            if os.path.isfile(candidate):
+                return candidate
+
+        raise FileNotFoundError(f"Shard não encontrado: {shard_path}")
+
+    def get(self, shard_path, metadata_path=None):
+        path = self._resolve_path(shard_path, metadata_path)
+
+        if path in self.cache:
+            self.cache_order.remove(path)
+            self.cache_order.append(path)
+            return self.cache[path]
+
+        logger.info("Mapeando shard: %s", path)
+
+        data = np.memmap(
+            path,
+            dtype=self.DTYPE,
+            mode="r",
+        )
+
+        if data.size % self.RECORD_INTS != 0:
+            raise RuntimeError(
+                f"Shard inválido: {path}. "
+                f"O tamanho não é múltiplo de {self.RECORD_INTS} int32 "
+                f"({self.RECORD_BYTES} bytes por registro)."
+            )
+
+        self.cache[path] = data
+        self.cache_order.append(path)
 
         while len(self.cache_order) > self.cache_size:
             old_path = self.cache_order.pop(0)
-            old_chunk = self.cache.pop(old_path, None)
+            old_data = self.cache.pop(old_path, None)
+            del old_data
 
-            if old_chunk is not None:
-                try:
-                    old_chunk.close()
-                except Exception:
-                    pass
+        return data
 
-        return chunk
+    def get_example(
+        self,
+        shard_path,
+        shard_index,
+        src_length,
+        tgt_length,
+        metadata_path=None,
+    ):
+        data = self.get(shard_path, metadata_path)
+
+        shard_index = int(shard_index)
+        src_length = int(src_length)
+        tgt_length = int(tgt_length)
+
+        if not 0 <= src_length <= self.MAX_SRC_LENGTH:
+            raise RuntimeError(
+                f"src_length inválido: {src_length}; "
+                f"esperado 0..{self.MAX_SRC_LENGTH}"
+            )
+
+        if not 0 <= tgt_length <= self.MAX_TGT_LENGTH:
+            raise RuntimeError(
+                f"tgt_length inválido: {tgt_length}; "
+                f"esperado 0..{self.MAX_TGT_LENGTH}"
+            )
+
+        if shard_index < 0:
+            raise RuntimeError(f"shard_index inválido: {shard_index}")
+
+        base = shard_index * self.RECORD_INTS
+        end = base + self.RECORD_INTS
+
+        if end > data.size:
+            raise RuntimeError(
+                f"shard_index={shard_index} está fora do shard "
+                f"{shard_path}."
+            )
+
+        record = data[base:end]
+
+        # Layout físico:
+        # [256 SRC][256 TGT][src_length][tgt_length]
+        stored_src_length = int(record[self.RECORD_INTS - 2])
+        stored_tgt_length = int(record[self.RECORD_INTS - 1])
+
+        if (
+            stored_src_length != src_length
+            or stored_tgt_length != tgt_length
+        ):
+            raise RuntimeError(
+                "Metadata e shard estão inconsistentes: "
+                f"metadata=({src_length}, {tgt_length}), "
+                f"shard=({stored_src_length}, {stored_tgt_length}), "
+                f"shard={shard_path}, index={shard_index}."
+            )
+
+        src = np.asarray(
+            record[:self.MAX_SRC_LENGTH][:src_length],
+            dtype=np.int64,
+        )
+        tgt = np.asarray(
+            record[
+                self.MAX_SRC_LENGTH:
+                self.MAX_SRC_LENGTH + self.MAX_TGT_LENGTH
+            ][:tgt_length],
+            dtype=np.int64,
+        )
+
+        return src, tgt
 
     def close(self):
-        for chunk in self.cache.values():
-            try:
-                chunk.close()
-            except Exception:
-                pass
-
         self.cache.clear()
         self.cache_order.clear()
 
 
-class StreamingTranslationDataset(torch.utils.data.IterableDataset):
+class TranslationDataset(Dataset):
     """
-    Streaming dataset com suporte a curriculum por comprimento.
+    Dataset indexável usando o metadata inteiro carregado na RAM.
 
-    Importante:
-    - Não guarda o metadata inteiro na RAM.
-    - Cada worker recebe arquivos diferentes.
-    - O comprimento é obtido do metadata antes de carregar o .npz.
-    - Exemplos acima do max_len atual são descartados.
-    - Os exemplos válidos passam pelo shuffle buffer.
-    - O batch_size é controlado pelo curriculum.
+    Os tokens ficam nos shards binários FIXOS. O metadata informa:
+        shard_path
+        shard_index
+        src_length
+        tgt_length
+
+    O shard sempre possui espaço físico para 256 tokens em cada lado, mas
+    somente os tokens até src_length/tgt_length são devolvidos ao modelo.
     """
 
     def __init__(
         self,
-        metadata_files: list[str],
+        metadata: pd.DataFrame,
         split_name: str,
         curriculum_sampler: CurriculumLengthSampler,
+        metadata_path: str,
         invert_src: bool = False,
         max_len: int | None = None,
         cache_size: int = 3,
-        shuffle_buffer_size: int = 10000,
+        shuffle: bool = False,
         seed: int = 42,
-        max_examples: int | None = None,
     ):
         super().__init__()
 
-        if not metadata_files:
-            raise ValueError("metadata_files não pode estar vazio.")
-
-        self.metadata_files = list(metadata_files)
+        self.metadata = metadata
         self.split_name = split_name.lower()
         self.curriculum_sampler = curriculum_sampler
+        self.metadata_path = metadata_path
         self.invert_src = invert_src
-
-        # max_len aqui continua como teto absoluto opcional.
         self.absolute_max_len = max_len
-
-        self.cache_size = max(1, int(cache_size))
-        self.shuffle_buffer_size = max(1, int(shuffle_buffer_size))
+        self.cache = FixedShardCache(cache_size)
+        self.shuffle = bool(shuffle)
         self.seed = int(seed)
-        self.max_examples = (
-            None if max_examples is None else max(0, int(max_examples))
+
+        split_mask = (
+            self.metadata["split"].astype(str).str.lower() == self.split_name
         )
+        self.indices = np.flatnonzero(split_mask.to_numpy())
+
+        if len(self.indices) == 0:
+            raise RuntimeError(
+                f"Nenhum exemplo encontrado para split='{self.split_name}'."
+            )
+
+    def __len__(self):
+        return len(self.indices)
 
     def _get_current_max_len(self):
-        # Mantido para compatibilidade interna. Durante __iter__, o valor
-        # efetivo é congelado no início da passagem.
         curriculum_max = self.curriculum_sampler.get_max_length()
-
         if self.absolute_max_len is None:
             return curriculum_max
-
         return min(curriculum_max, self.absolute_max_len)
 
-    def _iter_metadata_rows(self, files):
-        for parquet_file in files:
-            try:
-                metadata = pd.read_parquet(parquet_file)
+    def __getitem__(self, idx):
+        row_idx = int(self.indices[idx])
+        row = self.metadata.iloc[row_idx]
 
-                if metadata.empty:
-                    continue
+        shard_path = str(row["shard_path"])
+        shard_index = int(row["shard_index"])
 
-                required = {"split", "npz_path", "npz_index"}
-                missing = required.difference(metadata.columns)
+        # IMPORTANTE:
+        # O tamanho REAL vem do metadata, e não dos 256 slots físicos.
+        src_length = int(row["src_length"])
+        tgt_length = int(row["tgt_length"])
 
-                if missing:
-                    logger.warning(
-                        "Ignorando %s: colunas ausentes %s",
-                        parquet_file,
-                        sorted(missing),
-                    )
-                    continue
+        max_len = self._get_current_max_len()
 
-                filtered = metadata[
-                    metadata["split"].astype(str).str.lower() == self.split_name
-                ]
+        # Curriculum filtra exemplos que ainda estão acima do limite atual.
+        # Não há necessidade de ler os tokens para descobrir isso.
+        if src_length > max_len or tgt_length > max_len:
+            raise IndexError(
+                f"Exemplo acima do max_len atual: "
+                f"src_length={src_length}, tgt_length={tgt_length}, "
+                f"max_len={max_len}."
+            )
 
-                # O campo length pode ter nomes diferentes dependendo do
-                # pipeline que gerou o metadata. Se existir, aproveitamos.
-                length_column = None
-                for candidate in (
-                    "src_length",
-                    "src_len",
-                    "source_length",
-                    "length",
-                    "len_src",
-                ):
-                    if candidate in filtered.columns:
-                        length_column = candidate
-                        break
+        src, tgt = self.cache.get_example(
+            shard_path=shard_path,
+            shard_index=shard_index,
+            src_length=src_length,
+            tgt_length=tgt_length,
+            metadata_path=self.metadata_path,
+        )
 
-                for row in filtered.itertuples(index=False):
-                    yield row, length_column
-
-                del filtered
-                del metadata
-
-            except Exception:
-                logger.exception(
-                    "Falha ao ler metadata %s; ignorando.",
-                    parquet_file,
-                )
-
-    @staticmethod
-    def _get_row_length(row, length_column):
-        if length_column is not None:
-            try:
-                return max(0, int(getattr(row, length_column)))
-            except (TypeError, ValueError, AttributeError):
-                pass
-
-        # Compatibilidade com metadata que não possui coluna de tamanho.
-        # Nesse caso, o comprimento precisa ser obtido do .npz.
-        return None
-
-    def _row_to_example(self, row, cache, max_len=None):
-        npz_path = str(row.npz_path)
-        npz_index = int(row.npz_index)
-
-        chunk = cache.get(npz_path)
-
-        src = chunk["src_tokens"][npz_index].astype(np.int64)
-        tgt = chunk["tgt_tokens"][npz_index].astype(np.int64)
+        # Cópias pequenas: apenas os tokens reais, nunca os 256 slots.
+        src = np.array(src, dtype=np.int64, copy=True)
+        tgt = np.array(tgt, dtype=np.int64, copy=True)
 
         if self.invert_src:
             src = src[::-1].copy()
 
-        if max_len is None:
-            max_len = self._get_current_max_len()
+        return torch.from_numpy(src), torch.from_numpy(tgt)
 
-        src = src[:max_len]
-        tgt = tgt[:max_len]
-
-        return (
-            torch.tensor(src, dtype=torch.long),
-            torch.tensor(tgt, dtype=torch.long),
-        )
-
-    def _row_is_valid(self, row, metadata_length, cache, max_len=None):
-        # if max_len is None:
-        #     max_len = self._get_current_max_len()
-
-        # if metadata_length is not None:
-        #     return metadata_length <= max_len
-
-        # # Fallback: precisamos abrir o .npz para descobrir o tamanho.
-        # npz_path = str(row.npz_path)
-        # npz_index = int(row.npz_index)
-
-        # chunk = cache.get(npz_path)
-        # src_length = len(chunk["src_tokens"][npz_index])
-
-        return True
-
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-
-        if worker_info is None:
-            worker_id = 0
-            num_workers = 1
-            worker_files = self.metadata_files
-        else:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            worker_files = self.metadata_files[worker_id::num_workers]
-
-        curriculum_level = self.curriculum_sampler.level_actual
-        current_max_len = int(curriculum_level["max_len"])
-
-        if self.absolute_max_len is not None:
-            current_max_len = min(current_max_len, self.absolute_max_len)
-
-        rng = np.random.default_rng(
-            self.seed
-            + worker_id
-            + self.curriculum_sampler.level_index * 100003
-        )
-
-        cache = NPZCache(self.cache_size)
-        buffer = []
-
-        yielded_examples = 0
-
-        try:
-            for row, length_column in self._iter_metadata_rows(worker_files):
-
-                # Limite de exemplos
-                if (
-                    self.max_examples is not None
-                    and yielded_examples >= self.max_examples
-                ):
-                    break
-
-                metadata_length = self._get_row_length(row, length_column)
-
-                if not self._row_is_valid(
-                    row,
-                    metadata_length,
-                    cache,
-                    current_max_len,
-                ):
-                    continue
-
-                if len(buffer) < self.shuffle_buffer_size:
-                    buffer.append(row)
-                    continue
-
-                idx = int(rng.integers(0, len(buffer)))
-                selected = buffer[idx]
-                buffer[idx] = row
-
-                yield self._row_to_example(
-                    selected,
-                    cache,
-                    current_max_len,
-                )
-
-                yielded_examples += 1
-
-            while buffer:
-
-                if (
-                    self.max_examples is not None
-                    and yielded_examples >= self.max_examples
-                ):
-                    break
-
-                idx = int(rng.integers(0, len(buffer)))
-                selected = buffer.pop(idx)
-
-                yield self._row_to_example(
-                    selected,
-                    cache,
-                    current_max_len,
-                )
-
-                yielded_examples += 1
-
-        finally:
-            cache.close()
+    def close(self):
+        self.cache.close()
 
 
 class CurriculumBatchIterableDataset(torch.utils.data.IterableDataset):
     """
-    Camada final que transforma o fluxo de exemplos em batches dinâmicos.
+    Mantém somente a responsabilidade de montar batches dinâmicos.
 
-    Isso evita depender de BatchSampler + Dataset indexável, que exigiria
-    índices globais em memória.
+    O metadata já está inteiro na RAM; portanto não existe mais streaming do
+    Parquet nem necessidade de múltiplos workers para ler metadata.
     """
 
-    def __init__(
-        self,
-        dataset: StreamingTranslationDataset,
-        curriculum_sampler: CurriculumLengthSampler,
-    ):
+    def __init__(self, dataset: TranslationDataset, curriculum_sampler):
         super().__init__()
         self.dataset = dataset
         self.curriculum_sampler = curriculum_sampler
 
+    def __len__(self):
+        return math.ceil(
+            len(self.dataset) / self.curriculum_sampler.get_batch_size()
+        )
+
     def __iter__(self):
         batch = []
-        batch_size = self.curriculum_sampler.get_batch_size()
 
-        for example in self.dataset:
+        # Embaralhamos os chunks, não cada exemplo individualmente.
+        # Isso preserva a localidade dos NPZs de 20k exemplos e evita
+        # abrir/trocar milhares de arquivos repetidamente no cache.
+        # Os índices abaixo são POSICIONAIS dentro de self.dataset.
+        # Isso é importante porque self.dataset.__getitem__ já converte
+        # a posição local para a linha correspondente do DataFrame.
+        indices = np.arange(len(self.dataset), dtype=np.int64)
+
+        if self.dataset.shuffle:
+            global_indices = self.dataset.indices[indices]
+            paths = self.dataset.metadata.iloc[global_indices]["shard_path"].to_numpy()
+
+            # Agrupamos por shard e embaralhamos os grupos. Isso preserva
+            # localidade do cache/memmap sem exigir que o metadata saia da RAM.
+            boundaries = np.flatnonzero(paths[1:] != paths[:-1]) + 1
+            groups = np.split(indices, boundaries)
+
+            rng = np.random.default_rng(self.dataset.seed)
+            rng.shuffle(groups)
+
+            indices = np.concatenate(groups) if groups else indices
+
+        for idx in indices:
+            batch_size = self.curriculum_sampler.get_batch_size()
+
+            try:
+                example = self.dataset[int(idx)]
+            except IndexError:
+                # Exemplo acima do limite do curriculum atual.
+                continue
+
             batch.append(example)
 
             if len(batch) >= batch_size:
@@ -553,39 +506,58 @@ class CurriculumBatchIterableDataset(torch.utils.data.IterableDataset):
             yield batch
 
 
-def build_streaming_dataset(
-    tokenized_dir: str,
-    split_name: str,
-    curriculum_sampler: CurriculumLengthSampler,
-    invert_src: bool = False,
-    max_len: int | None = None,
-    cache_size: int = 3,
-    shuffle_buffer_size: int = 10000,
-    seed: int = 42,
-    max_examples: int | None = None
-):
-    metadata_files = discover_metadata_files(tokenized_dir, split_name)
+def load_metadata_to_ram(metadata_path: str) -> pd.DataFrame:
+    """Carrega o único metadata Parquet inteiro para a RAM."""
+    logger.info("Carregando metadata inteiro na RAM: %s", metadata_path)
+    metadata = pd.read_parquet(metadata_path)
+
+    required = {"split", "shard_path", "shard_index", "src_length", "tgt_length"}
+    missing = required.difference(metadata.columns)
+    if missing:
+        raise RuntimeError(
+            "Metadata não possui as colunas obrigatórias: "
+            f"{sorted(missing)}"
+        )
 
     logger.info(
-        "Split '%s': %d arquivos de metadata serão processados por streaming.",
-        split_name,
-        len(metadata_files),
+        "Metadata carregado: %d linhas, %.2f MB em memória.",
+        len(metadata),
+        metadata.memory_usage(deep=True).sum() / (1024 ** 2),
     )
+    return metadata
 
-    base_dataset = StreamingTranslationDataset(
-        metadata_files=metadata_files,
+
+def build_dataset(
+    metadata: pd.DataFrame,
+    split_name: str,
+    curriculum_sampler: CurriculumLengthSampler,
+    metadata_path: str,
+    invert_src: bool = False,
+    max_len: int | None = None,
+    cache_size: int = 2,
+    shuffle: bool = False,
+    seed: int = 42,
+):
+    dataset = TranslationDataset(
+        metadata=metadata,
         split_name=split_name,
         curriculum_sampler=curriculum_sampler,
+        metadata_path=metadata_path,
         invert_src=invert_src,
         max_len=max_len,
         cache_size=cache_size,
-        shuffle_buffer_size=shuffle_buffer_size,
+        shuffle=shuffle,
         seed=seed,
-        max_examples=max_examples
+    )
+
+    logger.info(
+        "Split '%s': %d exemplos disponíveis na RAM.",
+        split_name,
+        len(dataset),
     )
 
     return CurriculumBatchIterableDataset(
-        dataset=base_dataset,
+        dataset=dataset,
         curriculum_sampler=curriculum_sampler,
     )
 
@@ -629,6 +601,7 @@ def eval(model, dataloader, criterion, step_info, writer, train_config, tokenize
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
 
+
             loss, loss_no_tf = model.eval_step(src, tgt, criterion)
 
             step_info["loss_eval"] += loss
@@ -646,9 +619,11 @@ def eval(model, dataloader, criterion, step_info, writer, train_config, tokenize
                     5,
                     6,
                     max_len=tgt.size(1),
+                    input_decoder=tgt[index_to_print:index_to_print + 1, :2]
                 )
                 ref_ids = tgt[index_to_print, 1:]
 
+                print('Começo dos tokens de referência (tgt):', tgt[index_to_print, :2])
                 print(f"Example tgt ids passed to model: {tgt[index_to_print, :-1]}")
                 print(f"Example ref ids: {ref_ids}")
                 print(f"Example pred ids: {preds_ids.squeeze()}")
@@ -656,38 +631,27 @@ def eval(model, dataloader, criterion, step_info, writer, train_config, tokenize
 
                 if tokenizer is not None:
                     try:
-                        ref_np = ref_ids.squeeze().cpu().numpy().tolist()
-                        pred_np = preds_ids.squeeze().cpu().numpy().tolist()
+                        ref_np = ref_ids.squeeze().cpu().numpy()
+                        pred_np = preds_ids.squeeze().cpu().numpy()
+                        preds_no_tf_np = preds_ids_no_tf
 
-                        # Normalize preds from no-teacher-forcing to a list of sequences
-                        preds_no_tf_raw = preds_ids_no_tf
-
-                        if isinstance(preds_no_tf_raw, torch.Tensor):
-                            preds_no_tf_list = preds_no_tf_raw.cpu().numpy().tolist()
-                        elif isinstance(preds_no_tf_raw, np.ndarray):
-                            preds_no_tf_list = preds_no_tf_raw.tolist()
-                        else:
-                            preds_no_tf_list = preds_no_tf_raw
-
-                        # If a single sequence (1D), wrap it for uniform handling
-                        if preds_no_tf_list and not isinstance(preds_no_tf_list[0], (list, tuple)):
-                            preds_no_tf_list = [preds_no_tf_list]
-
-                        decoded_preds_no_tf = []
-                        for seq in preds_no_tf_list:
-                            try:
-                                # Ensure sequence is a plain Python list of ints
-                                seq_list = list(seq)
-                                decoded_preds_no_tf.append(
-                                    tokenizer.decode(seq_list, skip_special_tokens=False)
-                                )
-                            except Exception:
-                                decoded_preds_no_tf.append("<decode error>")
-
-                        print("Src decoded:", tokenizer.decode(list(src[index_to_print].cpu().numpy()), skip_special_tokens=False))
-                        print(f"Example ref decoded: {tokenizer.decode(ref_np, skip_special_tokens=False)}")
-                        print(f"Example pred decoded: {tokenizer.decode(pred_np, skip_special_tokens=False)}")
-                        print("Example pred decoded (no TF):", "; ".join(decoded_preds_no_tf))
+                        print(
+                            "Src decoded:",
+                            tokenizer.decode(
+                                src[index_to_print].cpu().numpy(),
+                                skip_special_tokens=False,
+                            ),
+                        )
+                        print(
+                            f"Example ref decoded: {tokenizer.decode(ref_np, skip_special_tokens=False)}"
+                        )
+                        print(
+                            f"Example pred decoded: {tokenizer.decode(pred_np, skip_special_tokens=False)}"
+                        )
+                        print(
+                            "Example pred decoded (no TF): "
+                            f"{tokenizer.decode_batch(preds_no_tf_np, skip_special_tokens=False)}"
+                        )
                     except Exception:
                         logger.exception("Failed to decode tokens with tokenizer")
 
@@ -757,7 +721,18 @@ def train(
     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
 
     for _ in range(int(1e6)):
-        for src, tgt in tqdm(dataloader):
+        base_dataset = getattr(dataloader.dataset, "dataset", dataloader.dataset)
+        total_examples = len(base_dataset) if hasattr(base_dataset, "__len__") else None
+
+        pbar = tqdm(
+            total=total_examples,
+            desc="Treinamento",
+            unit="ex",
+            mininterval=1.0,
+        )
+
+        for src, tgt in dataloader:
+            pbar.update(src.size(0))
             src = src.to(train_config["device"])
             tgt = tgt.to(train_config["device"])
 
@@ -860,6 +835,8 @@ def train(
                         logger.info("Early stopping triggered.")
                         break
 
+            pbar.close()
+
             if stop:
                 break
 
@@ -871,6 +848,15 @@ def train(
 if __name__ == "__main__":
     args = ArgumentParser()
     args.add_argument("--tokenized_dir", type=str, default="/media/alvarinho/dados/Datasets/refined/traducao/tokenized")
+    args.add_argument(
+        "--metadata_path",
+        type=str,
+        default=None,
+        help=(
+            "Caminho do único metadata Parquet consolidado. "
+            "Por padrão: <tokenized_dir>/analise_textos_tokenized_split.parquet"
+        ),
+    )
     args.add_argument("--tokenizer_path", type=str, default="artifacts/tokenizer_en_pt_es_60000.json")
     args.add_argument("--invert_src", default=False, action="store_true")
     args.add_argument("--architecture", type=str, default="lstm", choices=["lstm", "transformer"])
@@ -886,28 +872,19 @@ if __name__ == "__main__":
     args.add_argument("--encoder_bidirectional", default=False, action="store_true")
     args.add_argument("--batch_size", type=int, default=64)
     args.add_argument(
-        "--num_workers",
-        type=int,
-        default=2,
-        help="Número de workers do DataLoader.",
-    )
-    args.add_argument(
-        "--metadata_shuffle_buffer",
-        type=int,
-        default=1000,
-        help="Quantidade de registros mantidos no buffer de shuffle.",
-    )
-    args.add_argument(
+        "--shard_cache_size",
         "--npz_cache_size",
+        dest="shard_cache_size",
         type=int,
-        default=3,
-        help="Quantidade máxima de arquivos .npz mantidos no cache por worker.",
+        default=6,
+        help="Quantidade máxima de shards binários mapeados no cache. "
+             "O alias --npz_cache_size é mantido por compatibilidade.",
     )
     args.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Seed do shuffle do metadata.",
+        help="Seed usada para embaralhar a ordem dos chunks de metadata.",
     )
     args.add_argument(
         "--curriculum_levels",
@@ -938,7 +915,7 @@ if __name__ == "__main__":
     args.add_argument("--no-teacher_forcing", dest="teacher_forcing", default=True, action="store_false")
     args.add_argument("--scheduler_sampling", default=False, action="store_true")
     args.add_argument("--teacher_forcing_ratio", type=float, default=1.0)
-    args.add_argument("--max_steps_scheduler_sampling", type=int, default=500000)
+    args.add_argument("--max_steps_scheduler_sampling", type=int, default=50000)
     args.add_argument("--attention", default=False, action="store_true")
     args.add_argument("--label_smoothing", default=0.0, type=float, help="Label smoothing value for the loss function (default: 0.0)")
     args.add_argument("--separate_embedding", default=False, action="store_true")
@@ -970,7 +947,7 @@ if __name__ == "__main__":
     else:
         curriculum_levels = [
             {
-                "max_len": min(30, args.max_len) if args.max_len is not None else 32,
+                "max_len": min(20, args.max_len) if args.max_len is not None else 20,
                 "batch_size": 128,
                 "accum_steps": 1,
                 "max_step": 10000,
@@ -986,12 +963,6 @@ if __name__ == "__main__":
                 "batch_size": 64,
                 "accum_steps": 2,
                 "max_step": 50000,
-            },
-            {
-                "max_len": min(256, args.max_len) if args.max_len is not None else 128,
-                "batch_size": 32,
-                "accum_steps": 4,
-                "max_step": 60000,
             },
             {
                 "max_len": args.max_len if args.max_len is not None else 256,
@@ -1019,28 +990,72 @@ if __name__ == "__main__":
     curriculum_sampler = CurriculumLengthSampler(curriculum_levels)
     dynamic_batch_sampler = DynamicBatchSampler(curriculum_sampler)
 
-    train_dataset = build_streaming_dataset(
-        tokenized_dir=args.tokenized_dir,
+    metadata_path = resolve_metadata_path(
+        args.tokenized_dir,
+        args.metadata_path,
+    )
+
+    # O metadata agora cabe na RAM: carregamos uma única vez e reutilizamos
+    # o mesmo DataFrame para train e val.
+    metadata = load_metadata_to_ram(metadata_path)
+
+
+    # ============================================================
+    # LIMITAR QUANTIDADE DE OBSERVAÇÕES
+    # ============================================================
+
+    if MAX_TRAIN_OBSERVATIONS is not None:
+        train_mask = metadata["split"] == "train"
+        train_indices = metadata.index[train_mask][:MAX_TRAIN_OBSERVATIONS]
+
+        # Mantém todos os outros splits e limita somente o train
+        metadata = metadata[
+            (~train_mask) | metadata.index.isin(train_indices)
+        ]
+
+    if MAX_VAL_OBSERVATIONS is not None:
+        val_mask = metadata["split"] == "val"
+        val_indices = metadata.index[val_mask][:MAX_VAL_OBSERVATIONS]
+
+        # Mantém todos os outros splits e limita somente o val
+        metadata = metadata[
+            (~val_mask) | metadata.index.isin(val_indices)
+        ]
+
+    logger.info(
+        "Metadata após limite: %d observações.",
+        len(metadata),
+    )
+
+    for split_name in metadata["split"].unique():
+        logger.info(
+            "Split '%s': %d observações.",
+            split_name,
+            (metadata["split"] == split_name).sum(),
+        )
+
+    train_dataset = build_dataset(
+        metadata=metadata,
         split_name="train",
         curriculum_sampler=curriculum_sampler,
+        metadata_path=metadata_path,
         invert_src=args.invert_src,
         max_len=args.max_len,
-        cache_size=args.npz_cache_size,
-        shuffle_buffer_size=args.metadata_shuffle_buffer,
+        cache_size=args.shard_cache_size,
+        shuffle=True,
         seed=args.seed,
     )
 
-    # Validação usa o mesmo nível atual do curriculum, mas não embaralha.
-    val_dataset = build_streaming_dataset(
-        tokenized_dir=args.tokenized_dir,
+    val_dataset = build_dataset(
+        metadata=metadata,
         split_name="val",
         curriculum_sampler=curriculum_sampler,
+        metadata_path=metadata_path,
         invert_src=args.invert_src,
         max_len=args.max_len,
-        cache_size=args.npz_cache_size,
-        shuffle_buffer_size=args.metadata_shuffle_buffer,
+        cache_size=args.shard_cache_size,
+        shuffle=False,
         seed=args.seed,
-        max_examples=1_000
     )
 
     dynamic_collator = DynamicCollator(
@@ -1048,25 +1063,18 @@ if __name__ == "__main__":
         pad_value=0,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=None,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=dynamic_collator,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-    )
+    # Metadata está na RAM e a leitura dos NPZs é feita localmente via cache.
+    # Não precisamos de workers para dividir a leitura do metadata.
+    loader_kwargs = {
+        "batch_size": None,
+        "shuffle": False,
+        "num_workers": 0,
+        "collate_fn": dynamic_collator,
+        "pin_memory": torch.cuda.is_available(),
+    }
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=None,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=dynamic_collator,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=args.num_workers > 0,
-    )
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, **loader_kwargs)
 
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
 
@@ -1145,10 +1153,10 @@ if __name__ == "__main__":
         extra={
             "tokenized_dir": args.tokenized_dir,
             "tokenizer_path": args.tokenizer_path,
-            "streaming_metadata": True,
-            "metadata_shuffle_buffer": args.metadata_shuffle_buffer,
-            "npz_cache_size": args.npz_cache_size,
-            "num_workers": args.num_workers,
+            "metadata_in_ram": True,
+            "metadata_path": metadata_path,
+            "shard_cache_size": args.shard_cache_size,
+            "num_workers": 0,
             "curriculum_levels": curriculum_levels,
         },
     )

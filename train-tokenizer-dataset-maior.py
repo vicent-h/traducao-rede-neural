@@ -130,14 +130,14 @@ def get_text_iterator(tsv_path, train_indices, batch_size=10000):
                     # ====================================================
                     # Verifica o sufixo do dataset_id para saber a direção[cite: 2]
                     if dataset_id.endswith('_en_pt'):
-                        text1_modificado = f"<2pt> {text1}"
+                        text2_modificado = f"<2pt> {text2}"
                     elif dataset_id.endswith('_en_es'):
-                        text1_modificado = f"<2es> {text1}"
+                        text2_modificado = f"<2es> {text2}"
                     else:
-                        text1_modificado = text1 # Fallback de segurança
+                        text2_modificado = text2 # Fallback de segurança
                         
                     # Adiciona o texto em inglês (com a tag) e o texto alvo ao lote
-                    batch.extend([text1_modificado, text2])
+                    batch.extend([text1, text2_modificado])
                     
                 if len(batch) >= batch_size:
                     yield batch
@@ -179,7 +179,7 @@ if __name__ == '__main__':
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,
             min_frequency=2,
-            special_tokens=["<PAD>", "<UNK>", "<CLS>", "<SEP>", "<MASK>", "<BOS>", "<EOS>"],
+            special_tokens=["<PAD>", "<UNK>", "<CLS>", "<SEP>", "<MASK>", "<BOS>", "<EOS>", "<2pt>", "<2es>"],
             end_of_word_suffix="</w>",
         )
 

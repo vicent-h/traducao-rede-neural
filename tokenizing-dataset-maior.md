@@ -1,578 +1,470 @@
-# Pipeline de Tokenização Streaming
-
-Pipeline para leitura, tokenização e armazenamento de grandes datasets de tradução utilizando:
-
-- TSV como fonte dos textos;
-- Parquet como fonte dos splits (`train`, `val`, `test`);
-- Tokenizers para tokenização;
-- multiprocessing para paralelização;
-- NPZ para armazenamento dos tokens;
-- Parquet para armazenamento dos metadados;
-- checkpoint para retomada automática;
-- arquivos temporários para garantir escrita segura;
-- processamento em streaming para evitar consumo excessivo de RAM.
-
----
+# Processamento de Tokenização com Shards
 
 ## 1. Objetivo
 
-O objetivo deste script é tokenizar um dataset grande sem precisar carregar todos os índices ou textos em memória.
+Este processamento foi desenvolvido para trabalhar com um dataset grande, em que:
 
-A arquitetura evita a criação de estruturas como:
+- o **TSV não cabe inteiro na RAM**;
+- o **Parquet de metadados cabe na RAM**;
+- a tokenização é relativamente pesada e deve ser paralelizada;
+- o processamento pode ser interrompido e posteriormente retomado;
+- não queremos criar um arquivo separado para cada exemplo;
+- queremos evitar perder uma grande quantidade de exemplos já tokenizados quando o processo é interrompido.
+
+O fluxo adotado é:
+
+```text
+TSV ────────────────┐
+                    ├──> batches ──> workers ──> resultados
+Parquet em RAM ─────┘                              │
+                                                   ▼
+                                          salvamento individual
+                                                   │
+                                                   ▼
+                                               SHARDS
+```
+
+---
+
+# 2. O que acontece durante o processamento?
+
+O processamento possui quatro etapas principais:
+
+```text
+1. Carregar Parquet em RAM
+              ↓
+2. Ler TSV em streaming
+              ↓
+3. Tokenizar em batches e em paralelo
+              ↓
+4. Persistir cada exemplo dentro de shards
+```
+
+A ideia importante é que **batch e shard são coisas diferentes**.
+
+- **Batch** determina como o trabalho é enviado para os workers.
+- **Shard** determina como os resultados são armazenados no disco.
+
+---
+
+# 3. Parquet em RAM
+
+O arquivo:
+
+```text
+analise_textos_split.parquet
+```
+
+é carregado inteiro em memória.
+
+Ele contém informações como:
+
+```text
+dataset_id
+index
+split
+```
+
+Isso permite acessar rapidamente os metadados enquanto o TSV é processado.
+
+O Parquet não precisa ser lido novamente a cada exemplo.
+
+---
+
+# 4. TSV em streaming
+
+O TSV continua sendo lido linha por linha.
+
+Isso é importante porque o TSV é grande demais para ser carregado inteiro em RAM.
+
+O programa faz:
+
+```text
+abre TSV
+   ↓
+lê linha
+   ↓
+compara com o Parquet
+   ↓
+usa os textos
+   ↓
+continua para a próxima linha
+```
+
+O programa também verifica se:
+
+```text
+dataset_id do TSV == dataset_id do Parquet
+index do TSV      == index do Parquet
+```
+
+Se houver uma diferença, o processamento é interrompido para evitar gerar dados incorretos.
+
+---
+
+# 5. Tokenização em batches
+
+A tokenização continua sendo feita em batches.
+
+Atualmente:
 
 ```python
-split_indices = {
-    "train": {
-        ...
-    },
-    "val": {
-        ...
-    },
-    "test": {
-        ...
-    }
+PARQUET_BATCH_SIZE = 10_000
+```
+
+Isso significa que o programa monta algo como:
+
+```text
+Batch 1
+10.000 exemplos
+      ↓
+Worker
+
+Batch 2
+10.000 exemplos
+      ↓
+Worker
+
+Batch 3
+10.000 exemplos
+      ↓
+Worker
+```
+
+Vários batches podem estar sendo processados simultaneamente pelos diferentes processos.
+
+O número máximo de batches pendentes é controlado por:
+
+```python
+MAX_PENDING = 16
+```
+
+E o número de processos por:
+
+```python
+MAX_WORKERS = 16
+```
+
+---
+
+# 6. O que é um shard?
+
+Um **shard** é simplesmente um arquivo que funciona como um grande container para vários exemplos.
+
+Em vez de fazer:
+
+```text
+exemplo_00000001.npz
+exemplo_00000002.npz
+exemplo_00000003.npz
+exemplo_00000004.npz
+...
+```
+
+fazemos:
+
+```text
+shard_000000.bin
+shard_000001.bin
+shard_000002.bin
+...
+```
+
+Cada shard contém muitos exemplos.
+
+Neste código:
+
+```python
+SHARD_SIZE = 100_000
+```
+
+Portanto:
+
+```text
+shard_000000.bin
+    ├── exemplo 0
+    ├── exemplo 1
+    ├── exemplo 2
+    ├── ...
+    └── exemplo 99.999
+
+shard_000001.bin
+    ├── exemplo 100.000
+    ├── exemplo 100.001
+    ├── ...
+```
+
+O número de arquivos passa a ser muito menor.
+
+---
+
+# 7. O exemplo continua sendo salvo individualmente
+
+Essa é a parte mais importante.
+
+"Salvar em shard" **não significa esperar o shard ficar completo para salvar**.
+
+Imagine que o batch terminou:
+
+```text
+Batch de 10.000 exemplos
+```
+
+O programa recebe os resultados e faz:
+
+```text
+Exemplo 1  → grava no shard
+Exemplo 2  → grava no shard
+Exemplo 3  → grava no shard
+Exemplo 4  → grava no shard
+...
+Exemplo 10.000 → grava no shard
+```
+
+Ou seja, cada exemplo é persistido individualmente.
+
+O shard é apenas o **container físico** onde esses exemplos são colocados.
+
+---
+
+# 8. Como um exemplo é armazenado?
+
+Cada exemplo possui:
+
+```text
+src_tokens
+tgt_tokens
+src_length
+tgt_length
+```
+
+Os tokens são armazenados em formato binário.
+
+Como `MAX_SRC_LENGTH` e `MAX_TGT_LENGTH` são fixos, cada registro possui exatamente o mesmo tamanho.
+
+Atualmente:
+
+```python
+MAX_SRC_LENGTH = 256
+MAX_TGT_LENGTH = 256
+```
+
+Os tokens são armazenados como `int32`.
+
+Isso permite calcular diretamente onde um exemplo está no arquivo:
+
+```text
+offset = índice_do_exemplo × tamanho_do_registro
+```
+
+Portanto, não é necessário criar um arquivo para cada exemplo.
+
+---
+
+# 9. E o JSONL?
+
+Além do `.bin`, cada shard possui um `.jsonl`.
+
+Por exemplo:
+
+```text
+shard_000123.bin
+shard_000123.jsonl
+```
+
+O `.bin` contém os tokens.
+
+O `.jsonl` contém os metadados.
+
+Uma linha pode representar algo como:
+
+```json
+{
+  "global_row": 12345678,
+  "dataset_id": "algum_dataset_en_pt",
+  "index": 54321,
+  "split": "train",
+  "shard": 123,
+  "shard_index": 45678,
+  "shard_path": ".../shard_000123.bin",
+  "src_length": 42,
+  "tgt_length": 37
 }
 ```
 
-que podem consumir uma quantidade significativa de memória quando o dataset possui milhões de exemplos.
-
-Em vez disso, o processamento ocorre em batches:
+Assim sabemos exatamente:
 
 ```text
-Parquet
-   │
-   ▼
-batch de índices
-   │
-   ▼
-TSV correspondente
-   │
-   ▼
-batch de textos
-   │
-   ▼
-workers
-   │
-   ▼
-tokenização
-   │
-   ▼
-NPZ + metadata
-```
-
-Somente uma pequena quantidade dos dados fica em memória por vez.
-
----
-
-# 2. Arquivos de entrada
-
-O pipeline utiliza dois arquivos principais.
-
-## 2.1 TSV
-
-O TSV contém os textos que serão tokenizados.
-
-Exemplo conceitual:
-
-```text
-dataset_id<SEP>index<METADATA>texto_origem<SEP>texto_destino
-```
-
-Exemplo:
-
-```text
-dataset_01_en_pt<SEP>123<METADATA>Hello world<SEP>Olá mundo
-```
-
-O script extrai:
-
-```python
-dataset_id = "dataset_01_en_pt"
-index = 123
-text1 = "Hello world"
-text2 = "Olá mundo"
+qual exemplo é
+        ↓
+em qual shard está
+        ↓
+qual posição ocupa dentro do shard
+        ↓
+quais são seus comprimentos
 ```
 
 ---
 
-## 2.2 Parquet de splits
+# 10. Por que não criar um `.npz` por exemplo?
 
-O Parquet contém a associação entre cada exemplo e seu split.
+Para um dataset com dezenas de milhões de exemplos, isso seria problemático.
 
-As colunas esperadas são:
+Por exemplo, para:
 
 ```text
-dataset_id
-index
-split
+51.000.000 exemplos
 ```
 
-Exemplo:
+teríamos aproximadamente:
 
-| dataset_id | index | split |
-|---|---:|---|
-| dataset_01_en_pt | 0 | train |
-| dataset_01_en_pt | 1 | train |
-| dataset_01_en_pt | 2 | val |
-| dataset_01_en_pt | 3 | test |
+```text
+51.000.000 arquivos
+```
+
+Além do espaço ocupado pelos dados, o sistema operacional precisa administrar:
+
+- diretórios;
+- inodes;
+- permissões;
+- timestamps;
+- abertura/fechamento de arquivos;
+- operações de filesystem;
+- listagens;
+- verificações;
+- backups;
+- exclusões.
+
+Mesmo que cada arquivo seja pequeno, **dezenas de milhões de arquivos é uma situação muito ruim para um filesystem convencional**.
+
+Com shards de 100.000 exemplos:
+
+```text
+51.000.000 / 100.000
+≈ 510 shards
+```
+
+Em vez de aproximadamente:
+
+```text
+51 milhões de arquivos
+```
+
+passamos para aproximadamente:
+
+```text
+510 arquivos .bin
++ 510 arquivos .jsonl
+```
+
+fora os arquivos auxiliares.
 
 ---
 
-# 3. Importante: ordem do TSV e Parquet
+# 11. Então os shards deixam a tokenização mais rápida?
 
-A versão atual do pipeline trabalha assumindo que o TSV e o Parquet possuem os exemplos na mesma ordem.
+## Não diretamente.
 
-Por exemplo:
+Essa distinção é muito importante.
 
-### TSV
+O shard **não torna a operação de tokenização de um texto magicamente mais rápida**.
 
-```text
-linha 0 → dataset_A / 0
-linha 1 → dataset_A / 1
-linha 2 → dataset_A / 2
-```
-
-### Parquet
+A tokenização continua sendo:
 
 ```text
-linha 0 → dataset_A / 0
-linha 1 → dataset_A / 1
-linha 2 → dataset_A / 2
-```
-
-O script verifica essa correspondência.
-
-Se encontrar algo como:
-
-```text
-TSV:
-dataset_A / 10
-
-Parquet:
-dataset_A / 15
-```
-
-o processamento é interrompido.
-
-Isso é proposital.
-
-É melhor interromper o processamento do que associar silenciosamente o `split` de um exemplo ao texto de outro.
-
----
-
-# 4. Configuração
-
-As principais configurações ficam no início do arquivo Python.
-
-```python
-MAX_SRC_LENGTH = 256
-MAX_TGT_LENGTH = 256
-
-NPZ_CHUNK_SIZE = 100_000
-
-PARQUET_BATCH_SIZE = 10_000
-
-MAX_PENDING = 8
-
-MAX_WORKERS = 8
-```
-
----
-
-## 4.1 `MAX_SRC_LENGTH`
-
-Tamanho máximo da sequência de origem.
-
-```python
-MAX_SRC_LENGTH = 256
-```
-
-Sequências maiores são truncadas.
-
-Sequências menores recebem padding.
-
----
-
-## 4.2 `MAX_TGT_LENGTH`
-
-Tamanho máximo da sequência de destino.
-
-```python
-MAX_TGT_LENGTH = 256
-```
-
-Funciona da mesma maneira que `MAX_SRC_LENGTH`.
-
----
-
-## 4.3 `NPZ_CHUNK_SIZE`
-
-Quantidade de exemplos armazenados em cada arquivo NPZ.
-
-```python
-NPZ_CHUNK_SIZE = 100_000
-```
-
-Isso produz arquivos aproximadamente assim:
-
-```text
-train_00000.npz
-train_00001.npz
-train_00002.npz
-
-val_00000.npz
-val_00001.npz
-
-test_00000.npz
-test_00001.npz
-```
-
-Um valor maior significa:
-
-- menos arquivos;
-- menos operações de I/O;
-- maior consumo de RAM durante o `flush`.
-
-Um valor menor significa:
-
-- menor consumo de RAM;
-- mais arquivos;
-- mais operações de I/O.
-
----
-
-# 5. `PARQUET_BATCH_SIZE`
-
-Define quantas linhas são lidas do Parquet por vez.
-
-```python
-PARQUET_BATCH_SIZE = 10_000
-```
-
-Por exemplo, com:
-
-```text
-10.000.000 rows
-```
-
-teremos aproximadamente:
-
-```text
-10.000.000 / 10.000
-= 1.000 batches
-```
-
-A fórmula é:
-
-```python
-import math
-
-num_batches = math.ceil(
-    parquet_rows / PARQUET_BATCH_SIZE
-)
-```
-
----
-
-# 6. `MAX_WORKERS`
-
-Define quantos processos serão utilizados para a tokenização.
-
-```python
-MAX_WORKERS = 8
-```
-
-Por exemplo:
-
-```text
-8 workers
-     │
-     ├── batch 1
-     ├── batch 2
-     ├── batch 3
-     ├── batch 4
-     ├── batch 5
-     ├── batch 6
-     ├── batch 7
-     └── batch 8
-```
-
-Quando um worker termina, recebe outro batch.
-
----
-
-# 7. `MAX_PENDING`
-
-Define quantos batches podem ficar simultaneamente aguardando processamento.
-
-```python
-MAX_PENDING = 8
-```
-
-Normalmente é interessante manter:
-
-```python
-MAX_PENDING = MAX_WORKERS
-```
-
-ou um valor pequeno acima disso.
-
-Evite colocar valores extremamente altos.
-
-Por exemplo:
-
-```python
-MAX_WORKERS = 8
-MAX_PENDING = 1000
-```
-
-pode fazer muitos batches ficarem acumulados na memória.
-
----
-
-# 8. Uso de memória
-
-Uma das principais características deste pipeline é evitar estruturas gigantes em RAM.
-
-O script **não cria um `split_indices` contendo todos os índices do dataset**.
-
-Em vez disso, trabalha aproximadamente assim:
-
-```text
-10.000 rows
-    ↓
-batch
-    ↓
-workers
-    ↓
+texto
+ ↓
+tokenizer
+ ↓
 tokens
+```
+
+O ganho principal está na **persistência e no gerenciamento dos dados**.
+
+---
+
+# 12. Onde está o ganho?
+
+O problema da abordagem anterior era principalmente o número gigantesco de arquivos.
+
+Imagine:
+
+```text
+tokeniza
+ ↓
+cria exemplo.npz
+ ↓
+escreve arquivo
+ ↓
+fecha arquivo
+ ↓
+cria metadata.parquet
+ ↓
+fecha arquivo
+ ↓
+próximo exemplo
+```
+
+Repetido dezenas de milhões de vezes.
+
+Isso gera uma quantidade enorme de operações de filesystem.
+
+Com shards:
+
+```text
+abre shard
     ↓
-NPZ
+escreve exemplo 1
     ↓
-libera memória
+escreve exemplo 2
+    ↓
+escreve exemplo 3
+    ↓
+...
+    ↓
+escreve exemplo 100.000
+    ↓
+fecha shard
 ```
 
-O consumo de memória passa a depender principalmente de:
-
-- `PARQUET_BATCH_SIZE`;
-- `MAX_PENDING`;
-- `MAX_WORKERS`;
-- `NPZ_CHUNK_SIZE`;
-- tamanho médio dos textos;
-- tamanho máximo das sequências.
+O filesystem passa a lidar com uma quantidade muito menor de arquivos.
 
 ---
 
-# 9. Tokenização
+# 13. Outra vantagem: retomada
 
-Cada worker carrega uma instância do tokenizer:
-
-```python
-def init_worker(tokenizer_path):
-
-    global _WORKER_TOKENIZER
-
-    _WORKER_TOKENIZER = Tokenizer.from_file(
-        tokenizer_path
-    )
-```
-
-O tokenizer é carregado uma vez por processo.
-
-Isso evita recarregar o tokenizer para cada batch.
-
----
-
-# 10. Tags de direção
-
-O pipeline adiciona tags dependendo do `dataset_id`.
-
-Para datasets terminando em:
+Imagine que o programa esteja processando:
 
 ```text
-_en_pt
+exemplo 12.345.678
 ```
 
-é adicionado:
+e o computador seja desligado.
 
-```text
-<2pt>
-```
+Na abordagem de um arquivo por exemplo, existem milhões de arquivos individuais para verificar.
 
-ao texto de origem.
-
-Para:
-
-```text
-_en_es
-```
-
-é adicionado:
-
-```text
-<2es>
-```
-
-Exemplo:
-
-```text
-Hello world
-```
-
-vira:
-
-```text
-<2pt> Hello world
-```
-
-antes da tokenização.
-
----
-
-# 11. Padding e truncamento
-
-Depois da tokenização, as sequências são ajustadas para o tamanho máximo.
+Com shards, o programa verifica o último shard.
 
 Por exemplo:
 
-```python
-MAX_SRC_LENGTH = 256
+```text
+shard_000123.bin
+shard_000123.jsonl
 ```
 
-Uma sequência com 300 tokens será truncada:
+Ele compara:
 
 ```text
-300 tokens
-    ↓
-256 tokens
+quantidade de registros no .bin
+        versus
+quantidade de registros no .jsonl
 ```
 
-Uma sequência com 100 tokens será preenchida:
-
-```text
-100 tokens
-    ↓
-100 tokens + 156 PAD
-```
-
-O ID de `<PAD>` é obtido diretamente do tokenizer:
-
-```python
-pad_id = tokenizer.token_to_id(
-    "<PAD>"
-)
-```
-
-Se o tokenizer não possuir `<PAD>`, o programa interrompe.
+Se houve uma interrupção no meio de uma gravação, ele consegue truncar o registro incompleto e continuar.
 
 ---
 
-# 12. Arquivos NPZ
-
-Os tokens são armazenados em arquivos `.npz`.
-
-Cada arquivo contém:
-
-```python
-src_tokens
-tgt_tokens
-src_lengths
-tgt_lengths
-```
-
-Exemplo:
-
-```python
-data = np.load(
-    "train_00000.npz"
-)
-
-src_tokens = data["src_tokens"]
-tgt_tokens = data["tgt_tokens"]
-src_lengths = data["src_lengths"]
-tgt_lengths = data["tgt_lengths"]
-```
-
-Os arrays são armazenados como:
-
-```python
-dtype=np.int32
-```
-
-para reduzir o consumo de armazenamento e memória.
-
----
-
-# 13. Metadados
-
-Para cada NPZ é criado um Parquet correspondente.
-
-Exemplo:
-
-```text
-train_00000.npz
-train_00000_meta.parquet
-```
-
-Os metadados possuem:
-
-```text
-dataset_id
-index
-split
-npz_path
-npz_index
-```
-
-Exemplo:
-
-| dataset_id | index | split | npz_path | npz_index |
-|---|---:|---|---|---:|
-| dataset_A | 100 | train | train_00000.npz | 0 |
-| dataset_A | 101 | train | train_00000.npz | 1 |
-| dataset_A | 102 | train | train_00000.npz | 2 |
-
-Assim é possível localizar exatamente onde determinado exemplo foi armazenado.
-
----
-
-# 14. Estrutura dos arquivos
-
-Ao final, o diretório será aproximadamente:
-
-```text
-tokenized/
-│
-├── train_00000.npz
-├── train_00001.npz
-├── train_00002.npz
-│
-├── val_00000.npz
-├── val_00001.npz
-│
-├── test_00000.npz
-├── test_00001.npz
-│
-├── checkpoint.json
-├── processing_config.json
-│
-├── analise_textos_tokenized_split.parquet
-│
-└── metadata_parts/
-    ├── train_00000_meta.parquet
-    ├── train_00001_meta.parquet
-    ├── train_00002_meta.parquet
-    ├── val_00000_meta.parquet
-    ├── val_00001_meta.parquet
-    ├── test_00000_meta.parquet
-    └── ...
-```
-
----
-
-# 15. Retomada automática
-
-O pipeline possui checkpoint.
+# 14. O checkpoint
 
 O arquivo:
 
@@ -580,504 +472,262 @@ O arquivo:
 checkpoint.json
 ```
 
-contém informações como:
+guarda informações como:
 
 ```json
 {
-  "tsv_rows_consumed": 5000000,
-  "processed_examples": 4998123,
-  "train_chunks": 42,
-  "val_chunks": 7,
-  "test_chunks": 3
+  "tsv_rows_consumed": 12345678,
+  "processed_examples": 12345678
 }
 ```
 
-Isso permite saber onde o processamento estava.
+O checkpoint só é atualizado depois que o batch correspondente foi persistido.
 
-Ao iniciar novamente, o programa lê:
+Assim:
+
+```text
+tokeniza batch
+      ↓
+grava exemplos
+      ↓
+batch persistido
+      ↓
+atualiza checkpoint
+```
+
+Isso evita que o checkpoint diga que um exemplo foi processado quando ele ainda não foi salvo.
+
+---
+
+# 15. O que acontece se o programa cair?
+
+Suponha:
+
+```text
+Batch = 10.000
+```
+
+O programa terminou a tokenização e começou a gravar:
+
+```text
+1
+2
+3
+...
+7.352
+```
+
+e caiu.
+
+Na próxima execução:
+
+```text
+abre os shards
+      ↓
+descobre o último registro válido
+      ↓
+remove eventual registro incompleto
+      ↓
+descobre a posição real
+      ↓
+avança o TSV até essa posição
+      ↓
+continua
+```
+
+Portanto, não é necessário refazer tudo desde o começo.
+
+---
+
+# 16. Por que o tamanho do registro é fixo?
+
+Temos:
 
 ```python
-checkpoint = load_checkpoint()
+MAX_SRC_LENGTH = 256
+MAX_TGT_LENGTH = 256
 ```
 
-e recupera:
-
-```python
-start_row = checkpoint[
-    "tsv_rows_consumed"
-]
-```
-
-Assim, o TSV não precisa ser processado novamente desde o início.
-
----
-
-# 16. Arquivos temporários
-
-O programa não grava diretamente no arquivo final.
-
-Por exemplo, para:
+Então cada exemplo sempre ocupa:
 
 ```text
-train_00042.npz
+256 tokens source
++
+256 tokens target
++
+2 comprimentos
 ```
 
-primeiro é criado:
-
-```text
-train_00042.npz.tmp
-```
-
-Depois que a gravação termina corretamente:
-
-```text
-train_00042.npz.tmp
-        ↓
-train_00042.npz
-```
-
-O mesmo mecanismo é utilizado para os metadados.
-
-Isso evita considerar um arquivo parcialmente escrito como um chunk válido.
-
----
-
-# 17. Escrita atômica
-
-O método utilizado é:
-
-```python
-os.replace(
-    temp_path,
-    final_path
-)
-```
-
-A ideia é que o arquivo final só apareça depois que o arquivo temporário estiver completo.
-
-Portanto, se o processo morrer durante:
-
-```text
-train_00042.npz.tmp
-```
-
-o próximo processamento pode detectar que o arquivo final:
-
-```text
-train_00042.npz
-```
-
-não existe e tratar aquele chunk como incompleto.
-
----
-
-# 18. Checkpoint seguro
-
-O checkpoint também é escrito de maneira atômica.
-
-Em vez de:
-
-```text
-checkpoint.json
-```
-
-ser sobrescrito diretamente, o programa cria:
-
-```text
-checkpoint.json.tmp
-```
-
-e depois executa:
-
-```python
-os.replace(
-    temp_path,
-    checkpoint_path
-)
-```
-
-Isso reduz o risco de ficar com um JSON corrompido caso o processo seja interrompido durante a escrita.
-
----
-
-# 19. O que acontece se o processo for interrompido?
-
-Suponha que o processamento esteja assim:
-
-```text
-train_00000.npz ✓
-train_00001.npz ✓
-train_00002.npz ✓
-train_00003.npz ✓
-train_00004.npz → processando
-```
-
-Se a máquina desligar:
-
-```text
-train_00000.npz ✓
-train_00001.npz ✓
-train_00002.npz ✓
-train_00003.npz ✓
-train_00004.npz.tmp
-```
-
-Ao reiniciar:
-
-1. O checkpoint é carregado.
-2. Os chunks completos permanecem.
-3. Arquivos `.tmp` são removidos.
-4. O processamento continua a partir do checkpoint.
-5. O chunk incompleto é refeito.
-
----
-
-# 20. Verificação dos chunks
-
-Antes de consolidar os metadados, o script verifica se todos os metadata possuem seu respectivo NPZ.
+Isso permite acesso direto.
 
 Por exemplo:
 
 ```text
-train_00042_meta.parquet
+registro 0
+registro 1
+registro 2
+registro 3
+...
 ```
 
-deve possuir:
+Se quisermos o registro 50.000:
 
 ```text
-train_00042.npz
+offset = 50.000 × RECORD_SIZE
 ```
 
-Se estiver faltando, o programa acusa o problema.
+O sistema pode ir diretamente para essa posição.
 
-Isso evita consolidar um dataset incompleto.
+Isso é muito interessante para o treinamento posteriormente.
 
 ---
 
-# 21. Consolidação dos metadados
+# 17. Fluxo completo
 
-Durante o processamento, os metadados são mantidos separados:
-
-```text
-metadata_parts/
-    train_00000_meta.parquet
-    train_00001_meta.parquet
-    train_00002_meta.parquet
-    ...
-```
-
-No final eles são consolidados em:
+O processamento pode ser visualizado assim:
 
 ```text
-analise_textos_tokenized_split.parquet
-```
-
-A consolidação também é feita de forma incremental.
-
-O código não precisa carregar todos os Parquets simultaneamente em memória.
-
----
-
-# 22. Barra de progresso
-
-Para mostrar progresso baseado em **rows**, utilize:
-
-```python
-pbar = tqdm(
-    total=parquet_rows,
-    desc="Processando",
-    unit="row",
-)
-```
-
-E, após processar cada DataFrame:
-
-```python
-pbar.update(
-    len(parquet_df)
-)
-```
-
-Assim, se o Parquet possuir:
-
-```text
-10.000.000 rows
-```
-
-a barra mostrará algo como:
-
-```text
-Processando: 35% | 3.500.000/10.000.000
+                     ┌─────────────────────┐
+                     │ Parquet             │
+                     │ inteiro em RAM      │
+                     └──────────┬──────────┘
+                                │
+                                │ metadados
+                                ▼
+┌─────────────┐          ┌───────────────┐
+│ TSV         │─────────>│ Batch 10.000  │
+│ streaming   │          └───────┬───────┘
+└─────────────┘                  │
+                                 ▼
+                       ┌──────────────────┐
+                       │ ProcessPool      │
+                       │ 16 workers       │
+                       └────────┬─────────┘
+                                │
+                                │ tokens
+                                ▼
+                       ┌──────────────────┐
+                       │ Commit ordenado  │
+                       └────────┬─────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    ▼                       ▼
+             exemplo 1                 exemplo 2
+                    │                       │
+                    └───────────┬───────────┘
+                                ▼
+                         ┌─────────────┐
+                         │   SHARD     │
+                         │ 100.000     │
+                         │ exemplos    │
+                         └──────┬──────┘
+                                │
+                         ┌──────┴──────┐
+                         ▼             ▼
+                    .bin tokens    .jsonl metadata
 ```
 
 ---
 
-# 23. Quantidade de batches
+# 18. O que mudou em relação ao código anterior?
 
-A quantidade de batches não depende de `MAX_WORKERS`.
+### Antes
 
-Ela depende de:
-
-```python
-PARQUET_BATCH_SIZE
-```
-
-A fórmula é:
-
-```python
-import math
-
-num_batches = math.ceil(
-    parquet_rows /
-    PARQUET_BATCH_SIZE
-)
-```
-
-Por exemplo:
+A ideia era:
 
 ```text
-parquet_rows = 10.000.000
-PARQUET_BATCH_SIZE = 10.000
-```
-
-resulta em:
-
-```text
-1.000 batches
-```
-
-Se:
-
-```text
-MAX_WORKERS = 8
-```
-
-isso significa apenas que até 8 batches podem ser processados simultaneamente.
-
-```text
-1.000 batches
-       │
-       ▼
-┌───────────────────────────────┐
-│  Worker 1 → batch             │
-│  Worker 2 → batch             │
-│  Worker 3 → batch             │
-│  Worker 4 → batch             │
-│  Worker 5 → batch             │
-│  Worker 6 → batch             │
-│  Worker 7 → batch             │
-│  Worker 8 → batch             │
-└───────────────────────────────┘
-```
-
-Quando um worker termina, recebe o próximo batch.
-
----
-
-# 24. Ajustando performance
-
-Os principais parâmetros para ajustar são:
-
-```python
-PARQUET_BATCH_SIZE
-NPZ_CHUNK_SIZE
-MAX_WORKERS
-MAX_PENDING
-```
-
-Uma configuração inicial razoável seria:
-
-```python
-PARQUET_BATCH_SIZE = 10_000
-NPZ_CHUNK_SIZE = 100_000
-MAX_WORKERS = 8
-MAX_PENDING = 8
-```
-
-Se houver muita RAM disponível, pode-se aumentar:
-
-```python
-PARQUET_BATCH_SIZE
-```
-
-Se a CPU estiver subutilizada, pode-se aumentar:
-
-```python
-MAX_WORKERS
-```
-
-Se houver pressão de memória, reduza:
-
-```python
-PARQUET_BATCH_SIZE
-MAX_PENDING
-NPZ_CHUNK_SIZE
-```
-
----
-
-# 25. Cuidados com memória
-
-Não aumente todos os parâmetros simultaneamente.
-
-Por exemplo, esta configuração pode consumir bastante RAM:
-
-```python
-PARQUET_BATCH_SIZE = 1_000_000
-NPZ_CHUNK_SIZE = 1_000_000
-MAX_WORKERS = 32
-MAX_PENDING = 32
-```
-
-Cada worker pode possuir uma quantidade considerável de textos/tokenizações em memória.
-
-Para datasets muito grandes, é preferível começar conservadoramente:
-
-```python
-PARQUET_BATCH_SIZE = 10_000
-NPZ_CHUNK_SIZE = 100_000
-MAX_WORKERS = 8
-MAX_PENDING = 8
-```
-
-e aumentar gradualmente.
-
----
-
-# 26. Dependências
-
-O script utiliza:
-
-```text
-numpy
-pandas
-pyarrow
-tqdm
-tokenizers
-```
-
-Instalação:
-
-```bash
-pip install numpy pandas pyarrow tqdm tokenizers
-```
-
----
-
-# 27. Execução
-
-Execute normalmente:
-
-```bash
-python tokenize_dataset.py
-```
-
-O script irá:
-
-```text
-1. verificar diretórios
-2. verificar configuração
-3. carregar tokenizer
-4. verificar o Parquet
-5. carregar checkpoint
-6. retomar o processamento
-7. ler TSV + Parquet em streaming
-8. enviar batches para os workers
-9. tokenizar
-10. salvar NPZ
-11. salvar metadata
-12. atualizar checkpoint
-13. verificar os chunks
-14. consolidar metadata
-```
-
----
-
-# 28. Começar novamente do zero
-
-Se quiser descartar completamente o processamento anterior, remova:
-
-```text
-checkpoint.json
-processing_config.json
-```
-
-e também os arquivos gerados:
-
-```text
-*.npz
-metadata_parts/*.parquet
-analise_textos_tokenized_split.parquet
-```
-
-Uma forma simples seria remover todo o diretório:
-
-```bash
-rm -rf /caminho/para/tokenized
-```
-
-Depois execute o script novamente.
-
-**Cuidado:** isso apaga os dados tokenizados existentes.
-
----
-
-# 29. Resumo da arquitetura
-
-O pipeline foi projetado para evitar o seguinte:
-
-```text
-TSV
+batch
  ↓
-carrega tudo
+tokenização
  ↓
-cria split_indices gigantes
+exemplos individuais
  ↓
-tokeniza
+1 NPZ por exemplo
+ ↓
+1 Parquet por exemplo
 ```
 
-Em vez disso:
+Problema:
 
 ```text
-                 TSV
-                  │
-             streaming
-                  │
-                  ▼
-              pequenos
-               batches
-                  │
-                  │
-Parquet ──────────┤
-                  │
-                  ▼
-             multiprocessing
-                  │
-        ┌─────────┼─────────┐
-        ▼         ▼         ▼
-     Worker    Worker    Worker
-        │         │         │
-        └─────────┼─────────┘
-                  ▼
-              Tokenização
-                  │
-                  ▼
-             NPZ chunks
-                  │
-                  ▼
-          Metadata Parquet
-                  │
-                  ▼
-             Checkpoint
+51 milhões de exemplos
+≈
+51 milhões de arquivos NPZ
++
+51 milhões de arquivos Parquet
 ```
 
-O resultado é um pipeline:
+Isso é extremamente pesado para o filesystem.
 
-- **streaming**;
-- **paralelizado**;
-- **incremental**;
-- **retomável**;
-- **resistente a interrupções**;
-- sem `split_indices` gigante em RAM;
-- com armazenamento em chunks;
-- com validação de consistência entre TSV e Parquet.
+### Agora
+
+Temos:
+
+```text
+batch
+ ↓
+tokenização
+ ↓
+exemplos individuais
+ ↓
+shard
+```
+
+Resultado aproximado para 51 milhões de exemplos:
+
+```text
+≈ 516 shards de 100.000 exemplos
+```
+
+mais os arquivos JSONL correspondentes.
+
+---
+
+# 19. O que NÃO mudou?
+
+É importante deixar claro que a arquitetura de processamento continua sendo:
+
+```text
+Parquet → RAM
+TSV → streaming
+       ↓
+batches
+       ↓
+ProcessPool
+       ↓
+tokenização paralela
+```
+
+Não transformamos a tokenização em um processamento de um exemplo por vez.
+
+O batch continua existindo justamente para manter o throughput dos workers.
+
+A mudança principal foi **onde e como os resultados são persistidos**.
+
+---
+
+# 20. Resumo
+
+| Componente | Como funciona |
+|---|---|
+| TSV | Streaming |
+| Parquet | Inteiro em RAM |
+| Tokenização | Em batches |
+| Paralelização | ProcessPool |
+| Batch | 10.000 exemplos |
+| Workers | 16 |
+| Salvamento | Individual |
+| Container | Shard |
+| Exemplos por shard | 100.000 |
+| Tokens | `.bin` |
+| Metadata | `.jsonl` |
+| Checkpoint | `checkpoint.json` |
+| Retomada | Automática |
+| Arquivo por exemplo | Não |
+| Perda em uma interrupção | Muito menor |
+
+## Em uma frase
+
+**Batch é a unidade de processamento; exemplo é a unidade de persistência; shard é a unidade física de armazenamento.**
+
+Essa separação é o principal motivo de termos escolhido essa arquitetura.

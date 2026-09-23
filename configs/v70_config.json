@@ -1,26 +1,25 @@
 {
     "tokenized_dir": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized",
+    "metadata_path": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized/analise_textos_tokenized_split.parquet",
     "tokenizer_path": "artifacts/tokenizer_en_pt_es_60000.json",
     "invert_src": false,
     "architecture": "transformer",
-    "embedding_dim": 512,
-    "encoder_hidden_dim": 512,
-    "decoder_hidden_dim": 512,
-    "encoder_num_layers": 2,
-    "decoder_num_layers": 2,
-    "encoder_num_heads": 4,
-    "decoder_num_heads": 4,
+    "embedding_dim": 256,
+    "encoder_hidden_dim": 256,
+    "decoder_hidden_dim": 256,
+    "encoder_num_layers": 1,
+    "decoder_num_layers": 1,
+    "encoder_num_heads": 2,
+    "decoder_num_heads": 2,
     "encoder_dropout": 0.0,
     "decoder_dropout": 0.0,
     "encoder_bidirectional": false,
-    "batch_size": 16,
-    "num_workers": 8,
-    "metadata_shuffle_buffer": 1000,
-    "npz_cache_size": 3,
+    "batch_size": 32,
+    "shard_cache_size": 6,
     "seed": 42,
     "curriculum_levels": [
         {
-            "max_len": 30,
+            "max_len": 20,
             "batch_size": 128,
             "accum_steps": 1,
             "max_step": 10000
@@ -38,14 +37,8 @@
             "max_step": 50000
         },
         {
-            "max_len": 256,
-            "batch_size": 32,
-            "accum_steps": 4,
-            "max_step": 60000
-        },
-        {
             "max_len": 512,
-            "batch_size": 16,
+            "batch_size": 32,
             "accum_steps": 4,
             "max_step": 100000
         }
@@ -53,7 +46,7 @@
     "accum_steps": 4,
     "log_steps": 250,
     "save_steps": 500,
-    "eval_steps": 1000,
+    "eval_steps": 2000,
     "device": "cuda",
     "desc": "Treinando em um dataset maior",
     "name": "v70",
@@ -70,9 +63,10 @@
     "teacher_forcing": true,
     "scheduler_sampling": true,
     "teacher_forcing_ratio": 1.0,
-    "max_steps_scheduler_sampling": 500000,
+    "max_steps_scheduler_sampling": 50000,
     "attention": true,
     "label_smoothing": 0.0,
     "separate_embedding": false,
-    "streaming_metadata": true
+    "metadata_in_ram": true,
+    "num_workers": 0
 }

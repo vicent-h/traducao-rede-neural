@@ -950,19 +950,19 @@ if __name__ == "__main__":
                 "max_len": min(20, args.max_len) if args.max_len is not None else 20,
                 "batch_size": 128,
                 "accum_steps": 1,
-                "max_step": 10000,
+                "max_step": 25000,
             },
             {
                 "max_len": min(64, args.max_len) if args.max_len is not None else 64,
                 "batch_size": 128,
                 "accum_steps": 1,
-                "max_step": 25000,
+                "max_step": 50000,
             },
             {
                 "max_len": min(128, args.max_len) if args.max_len is not None else 128,
                 "batch_size": 64,
                 "accum_steps": 2,
-                "max_step": 50000,
+                "max_step": 75000,
             },
             {
                 "max_len": args.max_len if args.max_len is not None else 256,

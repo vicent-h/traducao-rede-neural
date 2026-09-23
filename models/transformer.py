@@ -452,6 +452,7 @@ class Transformer(nn.Module):
             device = src.device
             if input_decoder is None:
                 input_decoder = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
+                outputs = [[bos_token_id] for _ in range(batch_size)]
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
             # positional encoding buffer is stored in self.positional_encoding.pe
@@ -459,7 +460,7 @@ class Transformer(nn.Module):
 
             seq_len = 1
 
-            outputs = [input_decoder for _ in range(batch_size)]
+            outputs = input_decoder.cpu().tolist()
 
             for _ in range(max_len):
 

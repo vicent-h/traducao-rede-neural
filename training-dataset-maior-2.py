@@ -962,7 +962,7 @@ if __name__ == "__main__":
                 "max_len": min(128, args.max_len) if args.max_len is not None else 128,
                 "batch_size": 64,
                 "accum_steps": 2,
-                "max_step": 75000,
+                "max_step": 50000,
             },
             {
                 "max_len": args.max_len if args.max_len is not None else 256,

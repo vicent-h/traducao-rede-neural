@@ -1,6 +1,6 @@
 {
     "tokenized_dir": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized",
-    "metadata_path": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized/analise_textos_tokenized_split.parquet",
+    "metadata_path": "/media/alvarinho/dados/Datasets/refined/traducao/tokenized/analise_textos_tokenized.parquet",
     "tokenizer_path": "artifacts/tokenizer_en_pt_es_60000.json",
     "invert_src": false,
     "architecture": "transformer",
@@ -15,40 +15,14 @@
     "decoder_dropout": 0.0,
     "encoder_bidirectional": false,
     "batch_size": 16,
-    "shard_cache_size": 6,
+    "num_workers": 16,
     "seed": 42,
-    "curriculum_levels": [
-        {
-            "max_len": 20,
-            "batch_size": 128,
-            "accum_steps": 1,
-            "max_step": 25000
-        },
-        {
-            "max_len": 64,
-            "batch_size": 128,
-            "accum_steps": 1,
-            "max_step": 50000
-        },
-        {
-            "max_len": 128,
-            "batch_size": 64,
-            "accum_steps": 2,
-            "max_step": 75000
-        },
-        {
-            "max_len": 512,
-            "batch_size": 16,
-            "accum_steps": 8,
-            "max_step": 100000
-        }
-    ],
-    "accum_steps": 8,
+    "accum_steps": 1,
     "log_steps": 250,
     "save_steps": 500,
-    "eval_steps": 2000,
+    "eval_steps": 500,
     "device": "cuda",
-    "desc": "Treinando em um dataset maior",
+    "desc": "Fazendo o slicing maior por conta do special token que aponta a linguagem destino",
     "name": "v70",
     "early_stop_patience": 100,
     "early_stop_min_delta": 0.0,
@@ -67,6 +41,6 @@
     "attention": true,
     "label_smoothing": 0.0,
     "separate_embedding": false,
-    "metadata_in_ram": true,
-    "num_workers": 0
+    "streaming_metadata": false,
+    "metadata_loaded_in_memory": true
 }

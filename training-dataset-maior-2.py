@@ -1,20 +1,21 @@
 from argparse import ArgumentParser
 from datetime import datetime
-import glob
 import json
 import logging
-import math
 import os
-from typing import List, Tuple
+from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Sampler, BatchSampler
 from tokenizers import Tokenizer
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import sacrebleu
+from rouge_score import rouge_scorer
 
 from models.lstm_proj_diff import LSTM
 from models.transformer import Transformer
@@ -24,118 +25,206 @@ from utils.warmup import WarmupScheduler
 
 logger = logging.getLogger(__name__)
 
-MAX_TRAIN_OBSERVATIONS = None      # None = usa todo o train
-MAX_VAL_OBSERVATIONS = 25_000      # Ex.: limita validação a 50 mil
+np.random.seed(42)
 
 
 def resolve_metadata_path(tokenized_dir: str, metadata_path: str | None = None) -> str:
-    """
-    Resolve o único arquivo de metadata consolidado.
-
-    Por padrão usa:
-        <tokenized_dir>/analise_textos_tokenized_split.parquet
-
-    Também aceita --metadata_path explícito.
-    """
+    """Resolve o único Parquet de metadados da nova estrutura."""
     if metadata_path:
         path = os.path.abspath(metadata_path)
     else:
         path = os.path.join(
             os.path.abspath(tokenized_dir),
-            "analise_textos_tokenized_split.parquet",
+            "analise_textos_tokenized.parquet",
         )
 
     if not os.path.isfile(path):
         raise FileNotFoundError(
-            f"Metadata consolidado não encontrado: {path}"
+            f"Parquet de metadados não encontrado: {path}. "
+            "Use --metadata_path para informar outro caminho."
         )
-
     return path
 
 
+class TranslationDataset(Dataset):
+    """Dataset que lê exemplos dos blocos .bin via numpy.memmap."""
 
-class CurriculumLengthSampler(torch.utils.data.Sampler):
-    """
-    Curriculum por comprimento sem materializar índices em RAM.
+    def __init__(
+        self, metadata_df, tokenized_dir, split_name,
+        invert_src=False, max_len=None, max_examples=None,
+        memmap_cache_size=4,
+    ):
+        required = {
+            "split", "block_id", "src_offset", "tgt_offset",
+            "src_length", "tgt_length",
+        }
+        missing = required - set(metadata_df.columns)
+        if missing:
+            raise ValueError(
+                f"Metadados sem colunas obrigatórias: {sorted(missing)}. "
+                f"Encontradas: {list(metadata_df.columns)}"
+            )
 
-    Como o treinamento agora usa num_workers=0, o estado do curriculum fica
-    diretamente no processo principal.
-    """
+        self.tokenized_dir = os.path.abspath(tokenized_dir)
+        self.blocks_dir = os.path.join(self.tokenized_dir, "blocks")
+        self.invert_src = invert_src
+        self.max_len = max_len
+        self.metadata_df = metadata_df.reset_index(drop=True)
+        self.memmap_cache_size = max(1, int(memmap_cache_size))
+        self._memmaps = OrderedDict()
 
-    def __init__(self, curriculum_levels):
-        if not curriculum_levels:
-            raise ValueError("curriculum_levels não pode estar vazio.")
+        splits = self.metadata_df["split"].astype(str).str.lower().to_numpy()
+        self.row_indices = np.flatnonzero(splits == split_name.lower())
 
+        if max_examples is not None and len(self.row_indices) > int(max_examples):
+            rng = np.random.default_rng(42)
+            self.row_indices = rng.choice(
+                self.row_indices, size=max(0, int(max_examples)), replace=False
+            )
+            self.row_indices.sort()
+
+        logger.info("Split '%s': %s exemplos", split_name, len(self.row_indices))
+
+    def __len__(self):
+        return len(self.row_indices)
+
+    def _get_memmap(self, block_id, side):
+        key = (int(block_id), side)
+        if key in self._memmaps:
+            self._memmaps.move_to_end(key)
+            return self._memmaps[key]
+
+        suffix = "src" if side == "src" else "tgt"
+        path = os.path.join(
+            self.blocks_dir, f"block_{int(block_id):05d}_{suffix}.bin"
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Bloco binário não encontrado: {path}")
+        if os.path.getsize(path) == 0:
+            raise ValueError(f"Bloco binário vazio: {path}")
+
+        mmap = np.memmap(path, dtype=np.int32, mode="r")
+        self._memmaps[key] = mmap
+        while len(self._memmaps) > self.memmap_cache_size:
+            self._memmaps.popitem(last=False)
+        return mmap
+
+    def __getitem__(self, idx):
+        row = self.metadata_df.iloc[int(self.row_indices[idx])]
+        block_id = int(row["block_id"])
+        src_offset, tgt_offset = int(row["src_offset"]), int(row["tgt_offset"])
+        src_length, tgt_length = int(row["src_length"]), int(row["tgt_length"])
+
+        if min(src_offset, tgt_offset, src_length, tgt_length) < 0:
+            raise ValueError(f"Offset/comprimento negativo nos metadados: {row.to_dict()}")
+
+        src_map = self._get_memmap(block_id, "src")
+        tgt_map = self._get_memmap(block_id, "tgt")
+
+        if src_offset + src_length > len(src_map):
+            raise IndexError(
+                f"Source excede bloco {block_id}: {src_offset}+{src_length}>{len(src_map)}"
+            )
+        if tgt_offset + tgt_length > len(tgt_map):
+            raise IndexError(
+                f"Target excede bloco {block_id}: {tgt_offset}+{tgt_length}>{len(tgt_map)}"
+            )
+
+        # Copia somente os tokens deste exemplo para a RAM.
+        src = np.asarray(
+            src_map[src_offset:src_offset + src_length], dtype=np.int64
+        ).copy()
+        tgt = np.asarray(
+            tgt_map[tgt_offset:tgt_offset + tgt_length], dtype=np.int64
+        ).copy()
+
+        if self.invert_src:
+            src = src[::-1].copy()
+        if self.max_len is not None:
+            src, tgt = src[:self.max_len], tgt[:self.max_len]
+
+        return torch.from_numpy(src), torch.from_numpy(tgt)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_memmaps"] = OrderedDict()
+        return state
+
+
+class CurriculumLengthSampler(Sampler):
+    """Seleciona e embaralha exemplos compatíveis com o nível atual."""
+
+    def __init__(self, metadata_df, curriculum_levels, seed=42):
+        self.metadata_df = metadata_df.reset_index(drop=True)
         self.curriculum_levels = curriculum_levels
+        self.level_index = 0
         self.step_count = 0
-        self._level_index = 0
+        self.level_actual = curriculum_levels[0]
+        self.rng = np.random.default_rng(seed)
+        self.src_lengths = self.metadata_df["src_length"].to_numpy(dtype=np.int64)
+        self.tgt_lengths = self.metadata_df["tgt_length"].to_numpy(dtype=np.int64)
+        self._skip_empty_levels()
 
-    @property
-    def level_index(self):
-        return self._level_index
-
-    @property
-    def level_actual(self):
-        return self.curriculum_levels[self.level_index]
+    def _skip_empty_levels(self):
+        while (
+            self.level_index < len(self.curriculum_levels) - 1
+            and len(self._valid_indices()) == 0
+        ):
+            self.level_index += 1
+            self.level_actual = self.curriculum_levels[self.level_index]
+            logger.warning(
+                "Nível do currículo sem exemplos elegíveis; avançando para max_len=%s.",
+                self.get_max_length(),
+            )
 
     def step(self):
         self.step_count += 1
-
-        current_index = self.level_index
-        current_level = self.curriculum_levels[current_index]
-
-        if (
-            self.step_count > current_level["max_step"]
-            and current_index < len(self.curriculum_levels) - 1
+        while (
+            self.level_index < len(self.curriculum_levels) - 1
+            and self.step_count >= self.curriculum_levels[self.level_index]["max_step"]
         ):
-            new_index = current_index + 1
-            self._level_index = new_index
-
-            new_level = self.curriculum_levels[new_index]
-
+            self.level_index += 1
+            self.level_actual = self.curriculum_levels[self.level_index]
+            self._skip_empty_levels()
             logger.info(
-                "Curriculum avançou para nível %d: max_len=%s, batch_size=%s, accum_steps=%s",
-                new_index,
-                new_level["max_len"],
-                new_level["batch_size"],
-                new_level["accum_steps"],
+                "Curriculum nível %d/%d: max_len=%s, batch_size=%s, accum_steps=%s",
+                self.level_index + 1, len(self.curriculum_levels),
+                self.get_max_length(), self.get_batch_size(), self.get_accum_steps(),
             )
 
     def get_max_length(self):
-        return int(self.level_actual["max_len"])
+        return self.level_actual["max_len"]
 
     def get_batch_size(self):
-        return int(self.level_actual["batch_size"])
+        return self.level_actual["batch_size"]
 
     def get_accum_steps(self):
-        return int(self.level_actual["accum_steps"])
+        return self.level_actual["accum_steps"]
+
+    def _valid_indices(self):
+        limit = self.get_max_length()
+        if limit is None:
+            return np.arange(len(self.metadata_df), dtype=np.int64)
+        return np.flatnonzero(
+            (self.src_lengths <= limit) & (self.tgt_lengths <= limit)
+        )
 
     def __iter__(self):
-        # Compatibilidade de API. A geração dos exemplos é feita pelo
-        # StreamingTranslationDataset.
-        return iter(())
+        indices = self._valid_indices()
+        self.rng.shuffle(indices)
+        return iter(indices.tolist())
 
     def __len__(self):
-        return 0
+        return len(self._valid_indices())
 
 
-class DynamicBatchSampler(torch.utils.data.BatchSampler):
-    """
-    Mantém a API do DynamicBatchSampler original.
-
-    No modo streaming, a montagem física dos batches acontece em
-    CurriculumBatchIterableDataset. Esta classe centraliza o estado do
-    curriculum e expõe batch_size/max_len/accum_steps.
-    """
-
-    def __init__(self, sampler: CurriculumLengthSampler):
+class DynamicBatchSampler(BatchSampler):
+    def __init__(self, sampler):
         self.sampler = sampler
         self.drop_last = False
-        self.batch_size = self.sampler.get_batch_size()
 
     def step(self):
         self.sampler.step()
-        self.batch_size = self.sampler.get_batch_size()
 
     def get_max_length(self):
         return self.sampler.get_max_length()
@@ -147,526 +236,487 @@ class DynamicBatchSampler(torch.utils.data.BatchSampler):
         return self.sampler.get_accum_steps()
 
     def __iter__(self):
-        return iter(())
-
-    def __len__(self):
-        return 0
-
-
-class DynamicCollator:
-    """Padding dinâmico usando o max_len atual do curriculum."""
-
-    def __init__(self, batch_sampler=None, curriculum_sampler=None, pad_value: int = 0):
-        self.batch_sampler = batch_sampler
-        self.curriculum_sampler = curriculum_sampler
-        self.pad_value = pad_value
-
-    def get_max_length(self):
-        if self.batch_sampler is not None:
-            return self.batch_sampler.get_max_length()
-        if self.curriculum_sampler is not None:
-            return self.curriculum_sampler.get_max_length()
-        raise RuntimeError("Nenhum sampler de curriculum configurado.")
-
-    def __call__(self, batch):
-        if not batch:
-            raise ValueError("Batch vazio recebido pelo DynamicCollator.")
-
-        max_len = self.get_max_length()
-
-        srcs = []
-        tgts = []
-
-        for src, tgt in batch:
-            src_list = src.tolist() if isinstance(src, torch.Tensor) else list(src)
-            tgt_list = tgt.tolist() if isinstance(tgt, torch.Tensor) else list(tgt)
-
-            src_list = src_list[:max_len]
-            tgt_list = tgt_list[:max_len]
-
-            src_list += [self.pad_value] * (max_len - len(src_list))
-            tgt_list += [self.pad_value] * (max_len - len(tgt_list))
-
-            srcs.append(torch.tensor(src_list, dtype=torch.long))
-            tgts.append(torch.tensor(tgt_list, dtype=torch.long))
-
-        return torch.stack(srcs), torch.stack(tgts)
-
-
-
-class FixedShardCache:
-    """
-    Cache LRU de shards binários fixos.
-
-    Formato dos shards gerados pelo tokenizador:
-        [256 int32 SRC][256 int32 TGT][int32 src_length][int32 tgt_length]
-
-    Cada registro ocupa 2056 bytes.
-    O metadata informa src_length/tgt_length, e somente os tokens reais
-    são devolvidos ao Dataset.
-    """
-
-    MAX_SRC_LENGTH = 512
-    MAX_TGT_LENGTH = 512
-    DTYPE = np.dtype("<i4")
-    RECORD_INTS = MAX_SRC_LENGTH + MAX_TGT_LENGTH + 2
-    RECORD_BYTES = RECORD_INTS * DTYPE.itemsize
-
-    def __init__(self, cache_size=5):
-        self.cache_size = max(1, int(cache_size))
-        self.cache = {}
-        self.cache_order = []
-
-    def _resolve_path(self, shard_path, metadata_path=None):
-        path = os.path.abspath(os.path.expanduser(str(shard_path)))
-
-        if os.path.isfile(path):
-            return path
-
-        if metadata_path:
-            candidate = os.path.abspath(
-                os.path.join(
-                    os.path.dirname(os.path.abspath(metadata_path)),
-                    str(shard_path),
-                )
-            )
-            if os.path.isfile(candidate):
-                return candidate
-
-        raise FileNotFoundError(f"Shard não encontrado: {shard_path}")
-
-    def get(self, shard_path, metadata_path=None):
-        path = self._resolve_path(shard_path, metadata_path)
-
-        if path in self.cache:
-            self.cache_order.remove(path)
-            self.cache_order.append(path)
-            return self.cache[path]
-
-        logger.info("Mapeando shard: %s", path)
-
-        data = np.memmap(
-            path,
-            dtype=self.DTYPE,
-            mode="r",
-        )
-
-        if data.size % self.RECORD_INTS != 0:
-            raise RuntimeError(
-                f"Shard inválido: {path}. "
-                f"O tamanho não é múltiplo de {self.RECORD_INTS} int32 "
-                f"({self.RECORD_BYTES} bytes por registro)."
-            )
-
-        self.cache[path] = data
-        self.cache_order.append(path)
-
-        while len(self.cache_order) > self.cache_size:
-            old_path = self.cache_order.pop(0)
-            old_data = self.cache.pop(old_path, None)
-            del old_data
-
-        return data
-
-    def get_example(
-        self,
-        shard_path,
-        shard_index,
-        src_length,
-        tgt_length,
-        metadata_path=None,
-    ):
-        data = self.get(shard_path, metadata_path)
-
-        shard_index = int(shard_index)
-        src_length = int(src_length)
-        tgt_length = int(tgt_length)
-
-        if not 0 <= src_length <= self.MAX_SRC_LENGTH:
-            raise RuntimeError(
-                f"src_length inválido: {src_length}; "
-                f"esperado 0..{self.MAX_SRC_LENGTH}"
-            )
-
-        if not 0 <= tgt_length <= self.MAX_TGT_LENGTH:
-            raise RuntimeError(
-                f"tgt_length inválido: {tgt_length}; "
-                f"esperado 0..{self.MAX_TGT_LENGTH}"
-            )
-
-        if shard_index < 0:
-            raise RuntimeError(f"shard_index inválido: {shard_index}")
-
-        base = shard_index * self.RECORD_INTS
-        end = base + self.RECORD_INTS
-
-        if end > data.size:
-            raise RuntimeError(
-                f"shard_index={shard_index} está fora do shard "
-                f"{shard_path}."
-            )
-
-        record = data[base:end]
-
-        # Layout físico:
-        # [256 SRC][256 TGT][src_length][tgt_length]
-        stored_src_length = int(record[self.RECORD_INTS - 2])
-        stored_tgt_length = int(record[self.RECORD_INTS - 1])
-
-        if (
-            stored_src_length != src_length
-            or stored_tgt_length != tgt_length
-        ):
-            raise RuntimeError(
-                "Metadata e shard estão inconsistentes: "
-                f"metadata=({src_length}, {tgt_length}), "
-                f"shard=({stored_src_length}, {stored_tgt_length}), "
-                f"shard={shard_path}, index={shard_index}."
-            )
-
-        src = np.asarray(
-            record[:self.MAX_SRC_LENGTH][:src_length],
-            dtype=np.int64,
-        )
-        tgt = np.asarray(
-            record[
-                self.MAX_SRC_LENGTH:
-                self.MAX_SRC_LENGTH + self.MAX_TGT_LENGTH
-            ][:tgt_length],
-            dtype=np.int64,
-        )
-
-        return src, tgt
-
-    def close(self):
-        self.cache.clear()
-        self.cache_order.clear()
-
-
-class TranslationDataset(Dataset):
-    """
-    Dataset indexável usando o metadata inteiro carregado na RAM.
-
-    Os tokens ficam nos shards binários FIXOS. O metadata informa:
-        shard_path
-        shard_index
-        src_length
-        tgt_length
-
-    O shard sempre possui espaço físico para 256 tokens em cada lado, mas
-    somente os tokens até src_length/tgt_length são devolvidos ao modelo.
-    """
-
-    def __init__(
-        self,
-        metadata: pd.DataFrame,
-        split_name: str,
-        curriculum_sampler: CurriculumLengthSampler,
-        metadata_path: str,
-        invert_src: bool = False,
-        max_len: int | None = None,
-        cache_size: int = 3,
-        shuffle: bool = False,
-        seed: int = 42,
-    ):
-        super().__init__()
-
-        self.metadata = metadata
-        self.split_name = split_name.lower()
-        self.curriculum_sampler = curriculum_sampler
-        self.metadata_path = metadata_path
-        self.invert_src = invert_src
-        self.absolute_max_len = max_len
-        self.cache = FixedShardCache(cache_size)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-
-        split_mask = (
-            self.metadata["split"].astype(str).str.lower() == self.split_name
-        )
-        self.indices = np.flatnonzero(split_mask.to_numpy())
-
-        if len(self.indices) == 0:
-            raise RuntimeError(
-                f"Nenhum exemplo encontrado para split='{self.split_name}'."
-            )
-
-    def __len__(self):
-        return len(self.indices)
-
-    def _get_current_max_len(self):
-        curriculum_max = self.curriculum_sampler.get_max_length()
-        if self.absolute_max_len is None:
-            return curriculum_max
-        return min(curriculum_max, self.absolute_max_len)
-
-    def __getitem__(self, idx):
-        row_idx = int(self.indices[idx])
-        row = self.metadata.iloc[row_idx]
-
-        shard_path = str(row["shard_path"])
-        shard_index = int(row["shard_index"])
-
-        # IMPORTANTE:
-        # O tamanho REAL vem do metadata, e não dos 256 slots físicos.
-        src_length = int(row["src_length"])
-        tgt_length = int(row["tgt_length"])
-
-        max_len = self._get_current_max_len()
-
-        # Curriculum filtra exemplos que ainda estão acima do limite atual.
-        # Não há necessidade de ler os tokens para descobrir isso.
-        if src_length > max_len or tgt_length > max_len:
-            raise IndexError(
-                f"Exemplo acima do max_len atual: "
-                f"src_length={src_length}, tgt_length={tgt_length}, "
-                f"max_len={max_len}."
-            )
-
-        src, tgt = self.cache.get_example(
-            shard_path=shard_path,
-            shard_index=shard_index,
-            src_length=src_length,
-            tgt_length=tgt_length,
-            metadata_path=self.metadata_path,
-        )
-
-        # Cópias pequenas: apenas os tokens reais, nunca os 256 slots.
-        src = np.array(src, dtype=np.int64, copy=True)
-        tgt = np.array(tgt, dtype=np.int64, copy=True)
-
-        if self.invert_src:
-            src = src[::-1].copy()
-
-        return torch.from_numpy(src), torch.from_numpy(tgt)
-
-    def close(self):
-        self.cache.close()
-
-
-class CurriculumBatchIterableDataset(torch.utils.data.IterableDataset):
-    """
-    Mantém somente a responsabilidade de montar batches dinâmicos.
-
-    O metadata já está inteiro na RAM; portanto não existe mais streaming do
-    Parquet nem necessidade de múltiplos workers para ler metadata.
-    """
-
-    def __init__(self, dataset: TranslationDataset, curriculum_sampler):
-        super().__init__()
-        self.dataset = dataset
-        self.curriculum_sampler = curriculum_sampler
-
-    def __len__(self):
-        return math.ceil(
-            len(self.dataset) / self.curriculum_sampler.get_batch_size()
-        )
-
-    def __iter__(self):
         batch = []
-
-        # Embaralhamos os chunks, não cada exemplo individualmente.
-        # Isso preserva a localidade dos NPZs de 20k exemplos e evita
-        # abrir/trocar milhares de arquivos repetidamente no cache.
-        # Os índices abaixo são POSICIONAIS dentro de self.dataset.
-        # Isso é importante porque self.dataset.__getitem__ já converte
-        # a posição local para a linha correspondente do DataFrame.
-        indices = np.arange(len(self.dataset), dtype=np.int64)
-
-        if self.dataset.shuffle:
-            global_indices = self.dataset.indices[indices]
-            paths = self.dataset.metadata.iloc[global_indices]["shard_path"].to_numpy()
-
-            # Agrupamos por shard e embaralhamos os grupos. Isso preserva
-            # localidade do cache/memmap sem exigir que o metadata saia da RAM.
-            boundaries = np.flatnonzero(paths[1:] != paths[:-1]) + 1
-            groups = np.split(indices, boundaries)
-
-            rng = np.random.default_rng(self.dataset.seed)
-            rng.shuffle(groups)
-
-            indices = np.concatenate(groups) if groups else indices
-
-        for idx in indices:
-            batch_size = self.curriculum_sampler.get_batch_size()
-
-            try:
-                example = self.dataset[int(idx)]
-            except IndexError:
-                # Exemplo acima do limite do curriculum atual.
-                continue
-
-            batch.append(example)
-
-            if len(batch) >= batch_size:
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) >= self.get_batch_size():
                 yield batch
                 batch = []
-
         if batch:
             yield batch
 
-
-def load_metadata_to_ram(metadata_path: str) -> pd.DataFrame:
-    """Carrega o único metadata Parquet inteiro para a RAM."""
-    logger.info("Carregando metadata inteiro na RAM: %s", metadata_path)
-    metadata = pd.read_parquet(metadata_path)
-
-    required = {"split", "shard_path", "shard_index", "src_length", "tgt_length"}
-    missing = required.difference(metadata.columns)
-    if missing:
-        raise RuntimeError(
-            "Metadata não possui as colunas obrigatórias: "
-            f"{sorted(missing)}"
-        )
-
-    logger.info(
-        "Metadata carregado: %d linhas, %.2f MB em memória.",
-        len(metadata),
-        metadata.memory_usage(deep=True).sum() / (1024 ** 2),
-    )
-    return metadata
+    def __len__(self):
+        size = max(1, self.get_batch_size())
+        return (len(self.sampler) + size - 1) // size
 
 
-def build_dataset(
-    metadata: pd.DataFrame,
-    split_name: str,
-    curriculum_sampler: CurriculumLengthSampler,
-    metadata_path: str,
-    invert_src: bool = False,
-    max_len: int | None = None,
-    cache_size: int = 2,
-    shuffle: bool = False,
-    seed: int = 42,
-):
-    dataset = TranslationDataset(
-        metadata=metadata,
-        split_name=split_name,
-        curriculum_sampler=curriculum_sampler,
-        metadata_path=metadata_path,
-        invert_src=invert_src,
-        max_len=max_len,
-        cache_size=cache_size,
-        shuffle=shuffle,
-        seed=seed,
-    )
-
-    logger.info(
-        "Split '%s': %d exemplos disponíveis na RAM.",
-        split_name,
-        len(dataset),
-    )
-
-    return CurriculumBatchIterableDataset(
-        dataset=dataset,
-        curriculum_sampler=curriculum_sampler,
-    )
-
-def build_collate_fn(pad_id: int = 0):
+def build_collate_fn(pad_id=0, max_len=None):
+    """Padding dinâmico pelo maior comprimento presente no batch."""
     def collate_fn(batch):
-        # batch = [(src, tgt), ...]
-        max_src_len = max(len(src) for src, _ in batch)
-        max_tgt_len = max(len(tgt) for _, tgt in batch)
+        srcs, tgts = zip(*batch)
+        max_src = max((x.numel() for x in srcs), default=0)
+        max_tgt = max((x.numel() for x in tgts), default=0)
+        if max_len is not None:
+            max_src, max_tgt = min(max_src, max_len), min(max_tgt, max_len)
 
-        srcs = []
-        tgts = []
-        for src, tgt in batch:
-            src = src[:max_src_len]
-            tgt = tgt[:max_tgt_len]
-
-            src_pad = torch.full((max_src_len,), pad_id, dtype=torch.long)
-            tgt_pad = torch.full((max_tgt_len,), pad_id, dtype=torch.long)
-
-            src_pad[: src.numel()] = src
-            tgt_pad[: tgt.numel()] = tgt
-
-            srcs.append(src_pad)
-            tgts.append(tgt_pad)
-
-        return torch.stack(srcs), torch.stack(tgts)
-
+        src_batch = torch.full((len(srcs), max_src), pad_id, dtype=torch.long)
+        tgt_batch = torch.full((len(tgts), max_tgt), pad_id, dtype=torch.long)
+        for i, (src, tgt) in enumerate(zip(srcs, tgts)):
+            src, tgt = src[:max_src], tgt[:max_tgt]
+            src_batch[i, :src.numel()] = src
+            tgt_batch[i, :tgt.numel()] = tgt
+        return src_batch, tgt_batch
     return collate_fn
 
 
-def eval(model, dataloader, criterion, step_info, writer, train_config, tokenizer=None):
+def load_metadata(tokenized_dir, metadata_path=None):
+    path = resolve_metadata_path(tokenized_dir, metadata_path)
+    logger.info("Carregando metadados: %s", path)
+    df = pd.read_parquet(path)
+    required = {
+        "global_row", "dataset_id", "index", "split", "block_id",
+        "row_in_block", "src_offset", "tgt_offset", "src_length", "tgt_length",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Parquet incompatível com a tokenização em blocos. "
+            f"Colunas ausentes: {sorted(missing)}; encontradas: {list(df.columns)}"
+        )
+    df["split"] = df["split"].astype(str).str.lower()
+    logger.info(
+        "Metadados: %s linhas, %s colunas, %s blocos",
+        f"{len(df):,}", len(df.columns), df["block_id"].nunique(),
+    )
+    return df, path
+
+
+def _length_bucket(length: int, bucket_size: int = 10) -> tuple[int, int]:
+    """Faixas inclusivas: 0-10, 11-20, 21-30, ..."""
+    length = max(0, int(length))
+    bucket_size = max(1, int(bucket_size))
+    if length <= bucket_size:
+        return 0, bucket_size
+    start = bucket_size + 1 + ((length - bucket_size - 1) // bucket_size) * bucket_size
+    return start, start + bucket_size - 1
+
+
+def _normalize_prediction_ids(prediction):
+    """Normaliza a saída de model.predict para list[int], inclusive batch=1."""
+    if isinstance(prediction, torch.Tensor):
+        prediction = prediction.detach().cpu().tolist()
+    elif isinstance(prediction, np.ndarray):
+        prediction = prediction.tolist()
+
+    # Algumas implementações retornam [[id, id, ...]] para batch=1.
+    while (
+        isinstance(prediction, (list, tuple))
+        and len(prediction) == 1
+        and isinstance(prediction[0], (list, tuple, np.ndarray, torch.Tensor))
+    ):
+        prediction = prediction[0]
+
+    if isinstance(prediction, torch.Tensor):
+        prediction = prediction.detach().cpu().tolist()
+    elif isinstance(prediction, np.ndarray):
+        prediction = prediction.tolist()
+
+    if not isinstance(prediction, (list, tuple)):
+        raise TypeError(
+            f"Formato inesperado retornado por model.predict: {type(prediction).__name__}"
+        )
+
+    return [int(token) for token in prediction]
+
+
+
+def _compute_batch_token_losses(
+    model: nn.Module,
+    src: torch.Tensor,
+    tgt: torch.Tensor,
+    criterion: nn.Module,
+):
+    """Calcula logits e cross-entropy por token, respeitando o criterion."""
+    decoder_input = tgt[:, :-1]
+    target = tgt[:, 1:]
+
+    logits = model(src, decoder_input)
+    batch_size, target_width, vocab_size = logits.shape
+
+    token_losses = F.cross_entropy(
+        logits.reshape(-1, vocab_size),
+        target.reshape(-1),
+        weight=getattr(criterion, "weight", None),
+        ignore_index=int(getattr(criterion, "ignore_index", 0)),
+        reduction="none",
+        label_smoothing=float(getattr(criterion, "label_smoothing", 0.0)),
+    ).reshape(batch_size, target_width)
+
+    ignore_index = int(getattr(criterion, "ignore_index", 0))
+    valid_mask = target.ne(ignore_index)
+    lengths = valid_mask.sum(dim=1)
+    loss_sums = (token_losses * valid_mask).sum(dim=1)
+
+    return target, valid_mask, lengths, loss_sums
+
+
+def _update_loss_statistics(
+    lengths: torch.Tensor,
+    loss_sums: torch.Tensor,
+    valid_mask: torch.Tensor,
+    bucket_size: int,
+    loss_by_length: dict,
+):
+    """Acumula loss global (por token) e loss média por exemplo/faixa."""
+    total_loss_sum = float(loss_sums.sum().item())
+    total_valid_tokens = int(valid_mask.sum().item())
+
+    for index in range(lengths.size(0)):
+        length = int(lengths[index].item())
+        if length <= 0:
+            continue
+
+        bucket = _length_bucket(length, bucket_size)
+        stats = loss_by_length.setdefault(
+            bucket, {"loss_sum": 0.0, "examples": 0}
+        )
+        example_loss = loss_sums[index] / lengths[index]
+        stats["loss_sum"] += float(example_loss.item())
+        stats["examples"] += 1
+
+    return total_loss_sum, total_valid_tokens
+
+
+def _new_translation_bucket():
+    return {
+        "predictions": [],
+        "references": [],
+        "rouge": {
+            "rouge1": 0.0,
+            "rouge2": 0.0,
+            "rougeL": 0.0,
+        },
+    }
+
+
+def _decode_example(
+    model: nn.Module,
+    tokenizer: Tokenizer,
+    src_example: torch.Tensor,
+    target_tokens: torch.Tensor,
+    bos_id: int,
+    eos_id: int,
+    max_len: int,
+):
+    """Gera uma tradução sem Teacher Forcing e decodifica referência/predição."""
+    prediction = model.predict(
+        src_example,
+        bos_id,
+        eos_id,
+        max_len=max_len,
+    )
+    prediction_ids = _normalize_prediction_ids(prediction)
+    reference_ids = target_tokens.detach().cpu().tolist()
+
+    prediction_text = tokenizer.decode(
+        prediction_ids, skip_special_tokens=True
+    ).strip()
+    reference_text = tokenizer.decode(
+        reference_ids, skip_special_tokens=True
+    ).strip()
+
+    return prediction_text, reference_text
+
+
+def _update_translation_statistics(
+    model: nn.Module,
+    tokenizer: Tokenizer,
+    src: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    lengths: torch.Tensor,
+    bucket_size: int,
+    bos_id: int,
+    eos_id: int,
+    rouge_metric: rouge_scorer.RougeScorer,
+    texts_by_length: dict,
+):
+    """Gera traduções e acumula BLEU/ROUGE por faixa de comprimento."""
+    for index in range(src.size(0)):
+        length = int(lengths[index].item())
+        if length <= 0:
+            continue
+
+        bucket = _length_bucket(length, bucket_size)
+        bucket_stats = texts_by_length.setdefault(
+            bucket, _new_translation_bucket()
+        )
+
+        prediction_text, reference_text = _decode_example(
+            model=model,
+            tokenizer=tokenizer,
+            src_example=src[index:index + 1],
+            target_tokens=target[index][valid_mask[index]],
+            bos_id=bos_id,
+            eos_id=eos_id,
+            max_len=target.size(1) + 1,
+        )
+
+        bucket_stats["predictions"].append(prediction_text)
+        bucket_stats["references"].append(reference_text)
+
+        rouge_scores = rouge_metric.score(reference_text, prediction_text)
+        for metric, score in rouge_scores.items():
+            bucket_stats["rouge"][metric] += score.fmeasure
+
+
+def _write_loss_metrics(
+    writer: SummaryWriter,
+    step: int,
+    total_loss_sum: float,
+    total_valid_tokens: int,
+    loss_by_length: dict,
+):
+    """Registra loss/perplexity globais e segmentadas no TensorBoard."""
+    eval_loss = total_loss_sum / max(total_valid_tokens, 1)
+    eval_perplexity = float(np.exp(min(eval_loss, 100.0)))
+
+    writer.add_scalar("Loss/Eval", eval_loss, step)
+    writer.add_scalar("Perplexity/Eval", eval_perplexity, step)
+
+    logger.info(
+        "Step %d | Eval loss %.5f | Perplexity %.5f | tokens %d",
+        step, eval_loss, eval_perplexity, total_valid_tokens,
+    )
+
+    for (bucket_start, bucket_end), stats in sorted(loss_by_length.items()):
+        bucket_name = f"{bucket_start:03d}-{bucket_end:03d}"
+        bucket_loss = stats["loss_sum"] / max(stats["examples"], 1)
+        bucket_perplexity = float(np.exp(min(bucket_loss, 100.0)))
+
+        writer.add_scalar(
+            f"Loss/Eval_by_length/{bucket_name}", bucket_loss, step
+        )
+        writer.add_scalar(
+            f"Perplexity/Eval_by_length/{bucket_name}",
+            bucket_perplexity,
+            step,
+        )
+        writer.add_scalar(
+            f"Examples/Eval_by_length/{bucket_name}",
+            stats["examples"],
+            step,
+        )
+
+        logger.info(
+            "Eval length %s | loss %.5f | perplexity %.5f | examples %d",
+            bucket_name, bucket_loss, bucket_perplexity, stats["examples"],
+        )
+
+    return eval_loss
+
+
+def _write_translation_metrics(
+    writer: SummaryWriter,
+    step: int,
+    texts_by_length: dict,
+):
+    """Calcula e registra BLEU/ROUGE globais e por faixa de comprimento."""
+    all_predictions = []
+    all_references = []
+    global_rouge_sums = {
+        "rouge1": 0.0,
+        "rouge2": 0.0,
+        "rougeL": 0.0,
+    }
+
+    for bucket_stats in texts_by_length.values():
+        all_predictions.extend(bucket_stats["predictions"])
+        all_references.extend(bucket_stats["references"])
+
+        for metric in global_rouge_sums:
+            global_rouge_sums[metric] += bucket_stats["rouge"][metric]
+
+    if not all_predictions:
+        logger.warning("Nenhuma tradução válida foi gerada para calcular BLEU/ROUGE.")
+        return
+
+    global_bleu = sacrebleu.corpus_bleu(
+        all_predictions, [all_references]
+    ).score
+    writer.add_scalar("Metrics/BLEU", global_bleu, step)
+
+    example_count = len(all_predictions)
+    global_rouge = {
+        metric: score_sum / example_count
+        for metric, score_sum in global_rouge_sums.items()
+    }
+    for metric, value in global_rouge.items():
+        writer.add_scalar(f"Metrics/{metric.upper()}", value, step)
+
+    logger.info(
+        "Translation metrics | BLEU %.2f | ROUGE-1 %.4f | "
+        "ROUGE-2 %.4f | ROUGE-L %.4f | examples %d",
+        global_bleu,
+        global_rouge["rouge1"],
+        global_rouge["rouge2"],
+        global_rouge["rougeL"],
+        example_count,
+    )
+
+    for (bucket_start, bucket_end), bucket_stats in sorted(texts_by_length.items()):
+        predictions = bucket_stats["predictions"]
+        references = bucket_stats["references"]
+        count = len(predictions)
+
+        if count == 0:
+            continue
+
+        bucket_name = f"{bucket_start:03d}-{bucket_end:03d}"
+        bucket_bleu = sacrebleu.corpus_bleu(
+            predictions, [references]
+        ).score
+
+        writer.add_scalar(
+            f"Metrics/BLEU_by_length/{bucket_name}",
+            bucket_bleu,
+            step,
+        )
+
+        bucket_rouge = {}
+        for metric, score_sum in bucket_stats["rouge"].items():
+            average = score_sum / count
+            bucket_rouge[metric] = average
+            writer.add_scalar(
+                f"Metrics/{metric.upper()}_by_length/{bucket_name}",
+                average,
+                step,
+            )
+
+        writer.add_scalar(
+            f"Examples/Metrics_by_length/{bucket_name}", count, step
+        )
+
+        logger.info(
+            "Metrics length %s | BLEU %.2f | ROUGE-1 %.4f | "
+            "ROUGE-2 %.4f | ROUGE-L %.4f | examples %d",
+            bucket_name,
+            bucket_bleu,
+            bucket_rouge["rouge1"],
+            bucket_rouge["rouge2"],
+            bucket_rouge["rougeL"],
+            count,
+        )
+
+
+def eval(
+    model,
+    dataloader,
+    criterion,
+    step_info,
+    writer,
+    train_config,
+    tokenizer=None,
+):
+    """
+    Executa a validação e registra as métricas no TensorBoard.
+
+    A loss é calculada com Teacher Forcing. BLEU e ROUGE usam traduções
+    autoregressivas, sem Teacher Forcing. O agrupamento considera o número
+    de tokens válidos do target, ignorando padding e o primeiro token.
+    """
     model.eval()
-    printed_example = False
-    num_batches = 0
 
-    with torch.no_grad():
-        progress = tqdm(dataloader, desc="Evaluating", unit="batch")
+    device = train_config["device"]
+    step = step_info["global_step"]
+    bucket_size = max(1, int(train_config.get("eval_length_bucket_size", 25)))
+    bos_id = int(train_config.get("bos_id", 5))
+    eos_id = int(train_config.get("eos_id", 6))
 
-        for src, tgt in progress:
-            num_batches += 1
+    loss_by_length = {}
+    texts_by_length = {}
+    total_loss_sum = 0.0
+    total_valid_tokens = 0
 
-            src = src.to(train_config["device"])
-            tgt = tgt.to(train_config["device"])
+    rouge_metric = rouge_scorer.RougeScorer(
+        ["rouge1", "rouge2", "rougeL"],
+        use_stemmer=False,
+    )
 
+    try:
+        with torch.inference_mode():
+            for src, tgt in tqdm(
+                dataloader, desc="Evaluating", unit="batch"
+            ):
+                src = src.to(device, non_blocking=True)
+                tgt = tgt.to(device, non_blocking=True)
 
-            loss, loss_no_tf = model.eval_step(src, tgt, criterion)
-
-            step_info["loss_eval"] += loss
-            step_info["loss_no_tf_eval"] += loss_no_tf
-
-            if not printed_example:
-                index_to_print = np.random.randint(0, src.size(0))
-                preds_logits = model(
-                    src[index_to_print:index_to_print + 1],
-                    tgt[index_to_print:index_to_print + 1, :-1],
+                target, valid_mask, lengths, loss_sums = (
+                    _compute_batch_token_losses(
+                        model=model,
+                        src=src,
+                        tgt=tgt,
+                        criterion=criterion,
+                    )
                 )
-                preds_ids = preds_logits.argmax(dim=-1)
-                preds_ids_no_tf = model.predict(
-                    src[index_to_print:index_to_print + 1],
-                    5,
-                    6,
-                    max_len=tgt.size(1),
-                    input_decoder=tgt[index_to_print:index_to_print + 1, :2]
+
+                batch_loss_sum, batch_valid_tokens = _update_loss_statistics(
+                    lengths=lengths,
+                    loss_sums=loss_sums,
+                    valid_mask=valid_mask,
+                    bucket_size=bucket_size,
+                    loss_by_length=loss_by_length,
                 )
-                ref_ids = tgt[index_to_print, 1:]
+                total_loss_sum += batch_loss_sum
+                total_valid_tokens += batch_valid_tokens
 
-                print('Começo dos tokens de referência (tgt):', tgt[index_to_print, :2])
-                print(f"Example tgt ids passed to model: {tgt[index_to_print, :-1]}")
-                print(f"Example ref ids: {ref_ids}")
-                print(f"Example pred ids: {preds_ids.squeeze()}")
-                print(f"Example pred ids (no TF): {preds_ids_no_tf}")
+                # if tokenizer is not None:
+                #     _update_translation_statistics(
+                #         model=model,
+                #         tokenizer=tokenizer,
+                #         src=src,
+                #         target=target,
+                #         valid_mask=valid_mask,
+                #         lengths=lengths,
+                #         bucket_size=bucket_size,
+                #         bos_id=bos_id,
+                #         eos_id=eos_id,
+                #         rouge_metric=rouge_metric,
+                #         texts_by_length=texts_by_length,
+                #     )
 
-                if tokenizer is not None:
-                    try:
-                        ref_np = ref_ids.squeeze().cpu().numpy()
-                        pred_np = preds_ids.squeeze().cpu().numpy()
-                        preds_no_tf_np = preds_ids_no_tf
+        eval_loss = _write_loss_metrics(
+            writer=writer,
+            step=step,
+            total_loss_sum=total_loss_sum,
+            total_valid_tokens=total_valid_tokens,
+            loss_by_length=loss_by_length,
+        )
 
-                        print(
-                            "Src decoded:",
-                            tokenizer.decode(
-                                src[index_to_print].cpu().numpy(),
-                                skip_special_tokens=False,
-                            ),
-                        )
-                        print(
-                            f"Example ref decoded: {tokenizer.decode(ref_np, skip_special_tokens=False)}"
-                        )
-                        print(
-                            f"Example pred decoded: {tokenizer.decode(pred_np, skip_special_tokens=False)}"
-                        )
-                        print(
-                            "Example pred decoded (no TF): "
-                            f"{tokenizer.decode_batch(preds_no_tf_np, skip_special_tokens=False)}"
-                        )
-                    except Exception:
-                        logger.exception("Failed to decode tokens with tokenizer")
+        if tokenizer is not None:
+            _write_translation_metrics(
+                writer=writer,
+                step=step,
+                texts_by_length=texts_by_length,
+            )
+        else:
+            logger.warning(
+                "Tokenizer não fornecido: BLEU e ROUGE não foram calculados."
+            )
 
-                printed_example = True
+        return eval_loss
 
-    return num_batches
-
+    finally:
+        model.train()
 
 def init_params(model: nn.Module, weight_init_method: str = None, bias_init_method: str = None):
     for name, param in model.named_parameters():
         if "weight" in name:
-            if weight_init_method == "xavier_uniform":
-                nn.init.xavier_uniform_(param)
-            elif weight_init_method == "xavier_normal":
-                nn.init.xavier_normal_(param)
+            if param.dim() >= 2:
+                if weight_init_method == "xavier_uniform":
+                    nn.init.xavier_uniform_(param)
+                elif weight_init_method == "xavier_normal":
+                    nn.init.xavier_normal_(param)
         if "bias" in name and bias_init_method is not None:
             if bias_init_method == "zeros":
                 nn.init.zeros_(param)
@@ -703,147 +753,100 @@ def log_teacher_forcing_ratio(scheduler_sampling: SigmoidSchedulerSampling, step
 
 
 def train(
-    model,
-    dataloader,
-    dataloader_eval,
-    criterion,
-    optimizer,
-    train_config,
-    step_info,
-    writer,
-    early_stopper,
-    scheduler,
-    tokenizer=None,
-    scheduler_sampling=None,
-    model_name: str = "model",
+    model, dataloader, dataloader_eval, criterion, optimizer,
+    train_config, step_info, writer, early_stopper, scheduler,
+    tokenizer=None, scheduler_sampling=None, model_name="model",
 ):
     stop = False
+    batch_sampler = dataloader.batch_sampler
+    optimizer.zero_grad(set_to_none=True)
+    accumulation_counter = 0
     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
 
-    for _ in range(int(1e6)):
-        base_dataset = getattr(dataloader.dataset, "dataset", dataloader.dataset)
-        total_examples = len(base_dataset) if hasattr(base_dataset, "__len__") else None
+    while step_info["global_step"] < train_config["max_steps"] and not stop:
+        progress = tqdm(dataloader, total=len(dataloader), desc="Training", unit="batch")
+        for src, tgt in progress:
+            src = src.to(train_config["device"], non_blocking=True)
+            tgt = tgt.to(train_config["device"], non_blocking=True)
 
-        pbar = tqdm(
-            total=total_examples,
-            desc="Treinamento",
-            unit="ex",
-            mininterval=1.0,
-        )
-
-        for src, tgt in dataloader:
-            pbar.update(src.size(0))
-            src = src.to(train_config["device"])
-            tgt = tgt.to(train_config["device"])
-
-            if tokenizer:
-                logger.debug(f"Src tokens: {src[0]}")
-                logger.debug(f"Src: {tokenizer.decode(src[0].cpu().numpy(), False)}")
-                logger.debug(f"Tgt tokens: {tgt[0, :-1]}")
-                logger.debug(f"Tgt: {tokenizer.decode(tgt[0].cpu().numpy(), False)}")
-                logger.debug(f"Tgt tokens shifted: {tgt[0, 1:]}")
-                logger.debug(f"Tgt shifted: {tokenizer.decode(tgt[0, 1:].cpu().numpy(), False)}")
-
-            current_accum_steps = max(
-                1,
-                int(
-                    train_config.get(
-                        "accum_steps",
-                        train_config["curriculum_batch_sampler"].get_accum_steps()
-                        if train_config.get("curriculum_batch_sampler") is not None
-                        else 1,
-                    )
-                ),
+            accum_steps = (
+                batch_sampler.get_accum_steps()
+                if hasattr(batch_sampler, "get_accum_steps")
+                else train_config["accum_steps"]
             )
+            accum_steps = max(1, int(accum_steps))
 
             loss = model.train_step(
-                src,
-                tgt,
-                criterion,
-                train_config["teacher_forcing"],
+                src, tgt, criterion, train_config["teacher_forcing"],
                 scheduler_sampling=scheduler_sampling,
             )
-            loss = loss / current_accum_steps
-            loss.backward()
-
-            step_info["loss_train"] += loss.item()
+            (loss / accum_steps).backward()
+            step_info["loss_train"] += float(loss.detach())
             step_info["loss_train_count"] += 1
             step_info["step"] += 1
+            accumulation_counter += 1
 
-            if train_config["clip_grad"] is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=train_config["clip_grad"])
+            if accumulation_counter >= accum_steps:
 
-            step_info["accum_counter"] = step_info.get("accum_counter", 0) + 1
-
-            if step_info["accum_counter"] >= current_accum_steps:
+                if train_config["clip_grad"] is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=train_config["clip_grad"]
+                    )
+                if step_info["global_step"] % train_config["log_steps"] == 0:
+                    log_gradients(model, step_info, writer)
                 optimizer.step()
-                step_info["accum_counter"] = 0
+                optimizer.zero_grad(set_to_none=True)
+                accumulation_counter = 0
                 scheduler.step()
                 if scheduler_sampling is not None:
                     scheduler_sampling.step()
-
-                # Avança o curriculum a cada optimizer step.
-                if train_config.get("curriculum_batch_sampler") is not None:
-                    train_config["curriculum_batch_sampler"].step()
-
-                # O batch/accum_steps usados no próximo ciclo vêm do novo nível.
-                if train_config.get("curriculum_batch_sampler") is not None:
-                    train_config["accum_steps"] = (
-                        train_config["curriculum_batch_sampler"].get_accum_steps()
-                    )
-
                 step_info["global_step"] += 1
+
+                # O currículo avança por atualização do otimizador, não por batch.
+                if hasattr(batch_sampler, "step"):
+                    batch_sampler.step()
 
                 if step_info["global_step"] % train_config["log_steps"] == 0:
                     avg_loss = step_info["loss_train"] / max(step_info["loss_train_count"], 1)
-                    logger.debug(f'Step {step_info["global_step"]} - Loss: {avg_loss:.4f}')
+                    logger.info(
+                        "Step %d | loss %.4f | max_len=%s | batch=%s | accum=%s",
+                        step_info["global_step"], avg_loss,
+                        batch_sampler.get_max_length() if hasattr(batch_sampler, "get_max_length") else "-",
+                        batch_sampler.get_batch_size() if hasattr(batch_sampler, "get_batch_size") else "-",
+                        batch_sampler.get_accum_steps() if hasattr(batch_sampler, "get_accum_steps") else accum_steps,
+                    )
                     writer.add_scalar("Loss/Train", avg_loss, step_info["global_step"])
-                    log_gradients(model, step_info, writer)
+                    
                     step_info["loss_train"] = 0
                     step_info["loss_train_count"] = 0
-
                     log_lr(optimizer, step_info, writer)
                     log_teacher_forcing_ratio(scheduler_sampling, step_info, writer)
 
-                optimizer.zero_grad()
-
                 if step_info["global_step"] % train_config["eval_steps"] == 0:
-                    eval_batches = eval(
-                        model,
-                        dataloader_eval,
-                        criterion,
-                        step_info,
-                        writer,
-                        train_config,
-                        tokenizer,
+                    eval_loss = eval(
+                        model, dataloader_eval, criterion, step_info,
+                        writer, train_config, tokenizer,
                     )
-                    eval_loss = step_info["loss_eval"] / max(eval_batches, 1)
-                    eval_loss_no_tf = step_info["loss_no_tf_eval"] / max(eval_batches, 1)
-                    logger.debug(f'Step {step_info["global_step"]} - Eval Loss: {eval_loss:.4f}')
-                    writer.add_scalar("Loss/Eval", eval_loss, step_info["global_step"])
-                    writer.add_scalar("Loss/Eval_no_teacher_forcing", eval_loss_no_tf, step_info["global_step"])
-                    step_info["loss_eval"] = 0
-                    step_info["loss_no_tf_eval"] = 0
 
                     if eval_loss < step_info["best_eval_loss"]:
                         step_info["best_eval_loss"] = eval_loss
+                        os.makedirs("artifacts", exist_ok=True)
                         torch.save(model.state_dict(), f"artifacts/model_{model_name}.pt")
-                        logger.debug(f"New best model saved at step {step_info['global_step']} with eval loss {eval_loss:.4f}")
+                        logger.info("Melhor modelo salvo no step %d.", step_info["global_step"])
 
                     stop = early_stopper.step(eval_loss)
                     if stop:
-                        logger.info("Early stopping triggered.")
+                        logger.info("Early stopping acionado.")
                         break
 
-            pbar.close()
+                if step_info["global_step"] >= train_config["max_steps"]:
+                    logger.info("Número máximo de steps atingido.")
+                    break
 
-            if stop:
-                break
+        progress.close()
 
-        if step_info["global_step"] >= train_config["max_steps"]:
-            logger.info("Max steps reached. Ending training.")
-            break
-
+    os.makedirs("artifacts", exist_ok=True)
+    torch.save(model.state_dict(), f"artifacts/model_{model_name}_last.pt")
 
 if __name__ == "__main__":
     args = ArgumentParser()
@@ -852,10 +855,7 @@ if __name__ == "__main__":
         "--metadata_path",
         type=str,
         default=None,
-        help=(
-            "Caminho do único metadata Parquet consolidado. "
-            "Por padrão: <tokenized_dir>/analise_textos_tokenized_split.parquet"
-        ),
+        help="Caminho do único Parquet de metadados; por padrão fica dentro de tokenized_dir.",
     )
     args.add_argument("--tokenizer_path", type=str, default="artifacts/tokenizer_en_pt_es_60000.json")
     args.add_argument("--invert_src", default=False, action="store_true")
@@ -871,34 +871,26 @@ if __name__ == "__main__":
     args.add_argument("--decoder_dropout", type=float, default=0.5)
     args.add_argument("--encoder_bidirectional", default=False, action="store_true")
     args.add_argument("--batch_size", type=int, default=64)
+    args.add_argument("--eval_batch_size", type=int, default=64)
+    args.add_argument("--max_examples_val", type=int, default=10000, help="Máximo de exemplos de validação; 0 usa todos.")
+    args.add_argument("--memmap_cache_size", type=int, default=12, help="Arquivos .bin mantidos em cache por worker.")
     args.add_argument(
-        "--shard_cache_size",
-        "--npz_cache_size",
-        dest="shard_cache_size",
+        "--num_workers",
         type=int,
-        default=6,
-        help="Quantidade máxima de shards binários mapeados no cache. "
-             "O alias --npz_cache_size é mantido por compatibilidade.",
+        default=2,
+        help="Número de workers do DataLoader.",
     )
-    args.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed usada para embaralhar a ordem dos chunks de metadata.",
-    )
-    args.add_argument(
-        "--curriculum_levels",
-        type=str,
-        default=None,
-        help=(
-            "JSON com os níveis do curriculum. Ex.: "
-            '[{"max_len":32,"batch_size":128,"accum_steps":1,"max_step":10000}, ...]'
-        ),
-    )
+    args.add_argument("--seed", type=int, default=42, help="Seed para embaralhar os exemplos de treino.")
     args.add_argument("--accum_steps", type=int, default=1)
     args.add_argument("--log_steps", type=int, default=500)
     args.add_argument("--save_steps", type=int, default=5000)
     args.add_argument("--eval_steps", type=int, default=2500)
+    args.add_argument(
+        "--eval_length_bucket_size", type=int, default=25,
+        help="Largura das faixas de comprimento na validação (default: 10; faixas 0-10, 11-20, ...).",
+    )
+    args.add_argument("--bos_id", type=int, default=5, help="ID do token BOS usado por model.predict.")
+    args.add_argument("--eos_id", type=int, default=6, help="ID do token EOS usado por model.predict.")
     args.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args.add_argument("--desc", type=str, default="")
     args.add_argument("--name", type=str, default=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
@@ -908,7 +900,12 @@ if __name__ == "__main__":
     args.add_argument("--max_steps", type=int, default=500000)
     args.add_argument("--learning_rate", type=float, default=1e-4)
     args.add_argument("--vocab_size", type=int, default=120000)
-    args.add_argument("--max_len", type=int, default=256)
+    args.add_argument(
+        "--max_len",
+        type=int,
+        default=None,
+        help="Trunca source e target neste limite; por padrão não trunca.",
+    )
     args.add_argument("--clip_grad", type=float, default=None)
     args.add_argument("--init_weight_method", type=str, default=None, choices=["xavier_uniform", "xavier_normal"])
     args.add_argument("--init_bias_method", type=str, default=None, choices=["zeros", "ones"])
@@ -919,6 +916,7 @@ if __name__ == "__main__":
     args.add_argument("--attention", default=False, action="store_true")
     args.add_argument("--label_smoothing", default=0.0, type=float, help="Label smoothing value for the loss function (default: 0.0)")
     args.add_argument("--separate_embedding", default=False, action="store_true")
+    args.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay (L2 penalty) for the optimizer (default: 0.0)")
     args = args.parse_args()
 
     logger.setLevel(logging.INFO)
@@ -931,150 +929,96 @@ if __name__ == "__main__":
 
     if args.max_len is not None:
         logger.info(
-            "Teto absoluto de comprimento: %s tokens.",
+            "Aplicando truncamento máximo de %s tokens por exemplo no loader.",
             args.max_len,
         )
 
-    # Curriculum. Se --curriculum_levels for informado, usamos exatamente
-    # os níveis fornecidos. Caso contrário, usamos um curriculum padrão.
-    if args.curriculum_levels:
-        try:
-            curriculum_levels = json.loads(args.curriculum_levels)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "--curriculum_levels precisa ser um JSON válido."
-            ) from exc
-    else:
-        curriculum_levels = [
-            {
-                "max_len": min(20, args.max_len) if args.max_len is not None else 20,
-                "batch_size": 128,
-                "accum_steps": 1,
-                "max_step": 25000,
-            },
-            {
-                "max_len": min(64, args.max_len) if args.max_len is not None else 64,
-                "batch_size": 128,
-                "accum_steps": 1,
-                "max_step": 50000,
-            },
-            {
-                "max_len": min(128, args.max_len) if args.max_len is not None else 128,
-                "batch_size": 64,
-                "accum_steps": 2,
-                "max_step": 50000,
-            },
-            {
-                "max_len": args.max_len if args.max_len is not None else 256,
-                "batch_size": args.batch_size,
-                "accum_steps": args.accum_steps,
-                "max_step": args.max_steps,
-            },
-        ]
-
-    required_keys = {"max_len", "batch_size", "accum_steps", "max_step"}
-    for i, level in enumerate(curriculum_levels):
-        missing = required_keys.difference(level)
-        if missing:
-            raise ValueError(
-                f"Curriculum nível {i} está sem as chaves: {sorted(missing)}"
-            )
-
-        if int(level["max_len"]) <= 0:
-            raise ValueError(f"Curriculum nível {i}: max_len deve ser > 0.")
-        if int(level["batch_size"]) <= 0:
-            raise ValueError(f"Curriculum nível {i}: batch_size deve ser > 0.")
-        if int(level["accum_steps"]) <= 0:
-            raise ValueError(f"Curriculum nível {i}: accum_steps deve ser > 0.")
-
-    curriculum_sampler = CurriculumLengthSampler(curriculum_levels)
-    dynamic_batch_sampler = DynamicBatchSampler(curriculum_sampler)
-
-    metadata_path = resolve_metadata_path(
-        args.tokenized_dir,
-        args.metadata_path,
+    metadata_df, resolved_metadata_path = load_metadata(
+        args.tokenized_dir, args.metadata_path
     )
 
-    # O metadata agora cabe na RAM: carregamos uma única vez e reutilizamos
-    # o mesmo DataFrame para train e val.
-    metadata = load_metadata_to_ram(metadata_path)
+    metadata_df_train = (
+        metadata_df[metadata_df["split"] == "train"].reset_index(drop=True)
+    )
+    metadata_df_val = (
+        metadata_df[metadata_df["split"] == "val"].reset_index(drop=True)
+    )
+    if metadata_df_train.empty:
+        raise ValueError("Não há exemplos com split='train' no Parquet.")
+    if metadata_df_val.empty:
+        raise ValueError("Não há exemplos com split='val' no Parquet.")
 
+    if args.max_examples_val > 0 and len(metadata_df_val) > args.max_examples_val:
+        metadata_df_val = metadata_df_val.sample(
+            n=args.max_examples_val, random_state=args.seed
+        ).reset_index(drop=True)
 
-    # ============================================================
-    # LIMITAR QUANTIDADE DE OBSERVAÇÕES
-    # ============================================================
+    final_max_len = args.max_len
+    if final_max_len is None:
+        final_max_len = int(max(
+            metadata_df_train["src_length"].max(),
+            metadata_df_train["tgt_length"].max(),
+        ))
 
-    if MAX_TRAIN_OBSERVATIONS is not None:
-        train_mask = metadata["split"] == "train"
-        train_indices = metadata.index[train_mask][:MAX_TRAIN_OBSERVATIONS]
+    curriculum_levels = [
+        {"max_step": 10000, "max_len": 25, "batch_size": 128, "accum_steps": 1},
+        {"max_step": 20000, "max_len": 50, "batch_size": 64, "accum_steps": 2},
+        {"max_step": 35000, "max_len": 100, "batch_size": 32, "accum_steps": 4},
+        {
+            "max_step": args.max_steps,
+            "max_len": final_max_len,
+            "batch_size": args.batch_size,
+            "accum_steps": args.accum_steps,
+        },
+    ]
+    # Evita níveis que estejam além do total de steps configurado.
+    curriculum_levels = [
+        level for level in curriculum_levels
+        if level["max_step"] < args.max_steps
+    ] + [{
+        "max_step": args.max_steps,
+        "max_len": final_max_len,
+        "batch_size": args.batch_size,
+        "accum_steps": args.accum_steps,
+    }]
 
-        # Mantém todos os outros splits e limita somente o train
-        metadata = metadata[
-            (~train_mask) | metadata.index.isin(train_indices)
-        ]
+    sampler = CurriculumLengthSampler(
+        metadata_df_train, curriculum_levels, seed=args.seed
+    )
+    batch_sampler = DynamicBatchSampler(sampler)
 
-    if MAX_VAL_OBSERVATIONS is not None:
-        val_mask = metadata["split"] == "val"
-        val_indices = metadata.index[val_mask][:MAX_VAL_OBSERVATIONS]
-
-        # Mantém todos os outros splits e limita somente o val
-        metadata = metadata[
-            (~val_mask) | metadata.index.isin(val_indices)
-        ]
-
-    logger.info(
-        "Metadata após limite: %d observações.",
-        len(metadata),
+    train_dataset = TranslationDataset(
+        metadata_df_train, args.tokenized_dir, "train",
+        invert_src=args.invert_src, max_len=args.max_len,
+        memmap_cache_size=args.memmap_cache_size,
+    )
+    val_dataset = TranslationDataset(
+        metadata_df_val, args.tokenized_dir, "val",
+        invert_src=args.invert_src, max_len=args.max_len,
+        memmap_cache_size=args.memmap_cache_size,
     )
 
-    for split_name in metadata["split"].unique():
-        logger.info(
-            "Split '%s': %d observações.",
-            split_name,
-            (metadata["split"] == split_name).sum(),
-        )
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
 
-    train_dataset = build_dataset(
-        metadata=metadata,
-        split_name="train",
-        curriculum_sampler=curriculum_sampler,
-        metadata_path=metadata_path,
-        invert_src=args.invert_src,
-        max_len=args.max_len,
-        cache_size=args.shard_cache_size,
-        shuffle=True,
-        seed=args.seed,
+    train_loader = DataLoader(
+        train_dataset,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        generator=generator,
+        batch_sampler=batch_sampler,
+        collate_fn=build_collate_fn(pad_id=0, max_len=args.max_len),
     )
-
-    val_dataset = build_dataset(
-        metadata=metadata,
-        split_name="val",
-        curriculum_sampler=curriculum_sampler,
-        metadata_path=metadata_path,
-        invert_src=args.invert_src,
-        max_len=args.max_len,
-        cache_size=args.shard_cache_size,
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=32,
         shuffle=False,
-        seed=args.seed,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        collate_fn=build_collate_fn(pad_id=0, max_len=args.max_len),
     )
-
-    dynamic_collator = DynamicCollator(
-        batch_sampler=dynamic_batch_sampler,
-        pad_value=0,
-    )
-
-    # Metadata está na RAM e a leitura dos NPZs é feita localmente via cache.
-    # Não precisamos de workers para dividir a leitura do metadata.
-    loader_kwargs = {
-        "batch_size": None,
-        "shuffle": False,
-        "num_workers": 0,
-        "collate_fn": dynamic_collator,
-        "pin_memory": torch.cuda.is_available(),
-    }
-
-    train_loader = DataLoader(train_dataset, **loader_kwargs)
-    val_loader = DataLoader(val_dataset, **loader_kwargs)
 
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
 
@@ -1114,7 +1058,7 @@ if __name__ == "__main__":
     init_params(model, weight_init_method=args.init_weight_method, bias_init_method=args.init_bias_method)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=args.label_smoothing)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = WarmupScheduler(optimizer, warmup_steps=args.warmup_steps, max_steps=args.max_steps)
     scheduler_sampling = SigmoidSchedulerSampling(
         teacher_forcing_ratio=args.teacher_forcing_ratio,
@@ -1128,24 +1072,24 @@ if __name__ == "__main__":
         "log_steps": args.log_steps,
         "save_steps": args.save_steps,
         "eval_steps": args.eval_steps,
+        "eval_length_bucket_size": args.eval_length_bucket_size,
+        "bos_id": args.bos_id,
+        "eos_id": args.eos_id,
         "device": args.device,
         "max_steps": args.max_steps,
         "clip_grad": args.clip_grad,
         "teacher_forcing": args.teacher_forcing,
-        "curriculum_batch_sampler": dynamic_batch_sampler,
     }
 
     step_info = {
         "loss_train": 0,
         "loss_train_count": 0,
-        "loss_eval": 0,
-        "loss_no_tf_eval": 0,
         "step": 0,
         "best_eval_loss": float("inf"),
         "global_step": 0,
-        "accum_counter": 0,
     }
 
+    os.makedirs("artifacts", exist_ok=True)
     writer = SummaryWriter(log_dir=f"runs/{args.name}")
     early_stopper = EarlyStopper(patience=args.early_stop_patience, min_delta=args.early_stop_min_delta)
     save_configs(
@@ -1153,11 +1097,11 @@ if __name__ == "__main__":
         extra={
             "tokenized_dir": args.tokenized_dir,
             "tokenizer_path": args.tokenizer_path,
-            "metadata_in_ram": True,
-            "metadata_path": metadata_path,
-            "shard_cache_size": args.shard_cache_size,
-            "num_workers": 0,
-            "curriculum_levels": curriculum_levels,
+            "streaming_metadata": False,
+            "token_storage_format": "int32_binary_blocks_memmap",
+            "metadata_path": resolved_metadata_path,
+            "metadata_loaded_in_memory": True,
+            "num_workers": args.num_workers,
         },
     )
 

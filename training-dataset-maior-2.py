@@ -918,6 +918,7 @@ if __name__ == "__main__":
     args.add_argument("--separate_embedding", default=False, action="store_true")
     args.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay (L2 penalty) for the optimizer (default: 0.0)")
     args = args.parse_args()
+    
 
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -936,6 +937,19 @@ if __name__ == "__main__":
     metadata_df, resolved_metadata_path = load_metadata(
         args.tokenized_dir, args.metadata_path
     )
+
+    save_configs(
+            args,
+            extra={
+                "tokenized_dir": args.tokenized_dir,
+                "tokenizer_path": args.tokenizer_path,
+                "streaming_metadata": False,
+                "token_storage_format": "int32_binary_blocks_memmap",
+                "metadata_path": resolved_metadata_path,
+                "metadata_loaded_in_memory": True,
+                "num_workers": args.num_workers,
+            },
+        )
 
     metadata_df_train = (
         metadata_df[metadata_df["split"] == "train"].reset_index(drop=True)
@@ -1035,7 +1049,6 @@ if __name__ == "__main__":
             decoder_dropout=args.decoder_dropout,
             vocab_size=args.vocab_size,
             kv_cache=False,
-            cross_attn_cache=False,
             pad_idx=0,
             separate_embedding=args.separate_embedding,
         )
@@ -1092,18 +1105,7 @@ if __name__ == "__main__":
     os.makedirs("artifacts", exist_ok=True)
     writer = SummaryWriter(log_dir=f"runs/{args.name}")
     early_stopper = EarlyStopper(patience=args.early_stop_patience, min_delta=args.early_stop_min_delta)
-    save_configs(
-        args,
-        extra={
-            "tokenized_dir": args.tokenized_dir,
-            "tokenizer_path": args.tokenizer_path,
-            "streaming_metadata": False,
-            "token_storage_format": "int32_binary_blocks_memmap",
-            "metadata_path": resolved_metadata_path,
-            "metadata_loaded_in_memory": True,
-            "num_workers": args.num_workers,
-        },
-    )
+    
 
     logger.info("Starting training loop...")
     train(

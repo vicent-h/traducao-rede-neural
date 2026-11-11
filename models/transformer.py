@@ -35,7 +35,6 @@ class Transformer(nn.Module):
             vocab_size=50_000,
             pad_idx=0,
             kv_cache=False,
-            cross_attn_cache=False,
             separate_embedding=False
         ):
         super(Transformer, self).__init__()

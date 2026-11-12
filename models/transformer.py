@@ -198,9 +198,9 @@ class Transformer(nn.Module):
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
             # positional encoding buffer is stored in self.positional_encoding.pe
-            pos_enc = self.positional_encoding.pe[:, :1, :].to(device)
+            pos_enc = self.positional_encoding.pe[:, :input_decoder.size(1), :].to(device)
 
-            seq_len = 1
+            seq_len = input_decoder.size(1)
 
             outputs = input_decoder.cpu().tolist()
 
